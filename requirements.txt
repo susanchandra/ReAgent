@@ -1,0 +1,16 @@
+# ReAgent — Minimal Requirements for Offline Testing
+#
+# These are the core packages ReAgent needs to run and test locally.
+# The full Jarvis environment also has audio, ML, and UI libraries not needed here.
+#
+# Install with:
+#   python -m venv reagent_env
+#   reagent_env\Scripts\activate
+#   pip install -r requirements.txt --no-index --find-links <local-wheel-cache>  # offline
+#   # OR: pip install -r requirements.txt  (online)
+#
+pydantic>=2.0.0
+filelock>=3.0.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+requests>=2.28.0

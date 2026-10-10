@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# Virtual environments
+reagent_env/
+venv/
+.env/
+.venv/
+env/
+
+# Environment / secrets (NEVER commit)
+.env
+*.env
+*.pem
+*.key
+secrets/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Test output / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+*.log
+*test_output*.txt
+
+
+# Temp / scratch
+*.tmp
+*.bak
+
+# Ledger files, locks, and atomic temp files (runtime state, NOT source controlled)
+~/.reagent/
+*.ledger.json
+*.lock
+*.tmp.*
+
+# Receipts, reports, and traces (runtime artifacts)
+reports/
+traces/
+*.receipt.json
+
+# Workspace sandbox (runtime, NOT source)
+workspace/
