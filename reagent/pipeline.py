@@ -20,7 +20,7 @@ Frozen loop:
 """
 
 import logging
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Callable
 
 from pydantic import BaseModel, Field
 
@@ -399,6 +399,8 @@ class ReAgentPipeline:
         params: Dict[str, Any],
         postconditions: Optional[List[Postcondition]] = None,
         max_recovery_attempts: int = 1,
+        probe_callback: Optional[Callable[[str, Dict[str, Any], int], Dict[str, Any]]] = None,
+        supports_idempotency: Optional[bool] = None,
     ) -> ExecutionCycleResult:
         """
         Full M3 pipeline execution with contract, verification, and recovery:
@@ -530,6 +532,8 @@ class ReAgentPipeline:
                     initial_v_res=v_res,
                     timeline=timeline,
                     max_attempts=max_recovery_attempts,
+                    probe_callback=probe_callback,
+                    supports_idempotency=supports_idempotency,
                 )
             )
 
@@ -576,19 +580,124 @@ class ReAgentPipeline:
         initial_v_res: VerificationResult,
         timeline: ObservabilityTimeline,
         max_attempts: int,
+        probe_callback: Optional[Callable[[str, Dict[str, Any], int], Dict[str, Any]]] = None,
+        supports_idempotency: Optional[bool] = None,
     ) -> Tuple[ActionResult, Evidence, VerificationResult, int, AgentStatus]:
         """
         Attempt bounded recovery when initial verification fails.
         Uses the same frozen_contract — the contract is NEVER relaxed.
+        Supports native ambiguity resolution when probe_callback is supplied.
         Returns (action_result, evidence, v_res, recovery_count, final_status).
         """
         current_v_res = initial_v_res
         recovery_count = 0
 
-        # ── Restraint Check: ambiguous outcome / lost response ─────────────
-        # If the contract required environmental state (e.g. files) and those
-        # postconditions ALREADY hold on disk despite a tool error or timeout,
-        # avoid redundant or duplicate side effects.
+        # ── Native Ambiguity Probe & Restraint Check ───────────────────────
+        if probe_callback is not None:
+            # 1. Execute Step 1 probe call
+            try:
+                probe_res = probe_callback(tool_name, original_params, 1)
+            except Exception as e:
+                # Probe raised exception (e.g. StatusUnavailable or Unobservable) -> fail closed
+                timeline.emit("AMBIGUITY_PROBE_FAILED", {"error": str(e)})
+                self.agent_state.status = AgentStatus.ESCALATED
+                self.reliability_state.escalations += 1
+                exc_type = type(e).__name__
+                if "StatusUnavailable" in exc_type:
+                    err_label = f"StatusProbeUnavailable: {e}"
+                elif "Unobservable" in exc_type:
+                    err_label = f"UnobservableEvidence: {e}"
+                else:
+                    err_label = f"ProbeError: {exc_type}: {e}"
+                dummy = ActionResult(tool_name=tool_name, success=False, error=err_label)
+                esc_ev = self.evidence_collector.collect_from_action(dummy)
+                esc_v = self.verifier.verify(
+                    recovery_decision_id=f"step-{self.agent_state.step_index}-escalation-probe",
+                    evidence=esc_ev,
+                    assertions=assertion_rules,
+                )
+                return dummy, esc_ev, esc_v, 0, AgentStatus.ESCALATED
+
+            probe_status = probe_res.get("status") if isinstance(probe_res, dict) else ("PRESENT" if probe_res else "ABSENT")
+
+            # If PRESENT: side effect committed despite failure/timeout -> RESTRAIN!
+            if probe_status == "PRESENT":
+                timeline.emit("RESTRAINT_OBSERVED", {
+                    "reason": "Authoritative probe confirmed state PRESENT; avoided duplicate write.",
+                })
+                self._record_action_success()
+                self.agent_state.status = AgentStatus.VERIFIED
+                restrained_action = ActionResult(
+                    tool_name=tool_name,
+                    success=True,
+                    output="Restrained: authoritative probe confirmed state PRESENT.",
+                )
+                restrained_ev = Evidence(source="probe_restraint", facts={"success": True, "observed_existing_state": True})
+                restrained_v = self.verifier.verify(
+                    recovery_decision_id=f"restraint-step-{self.agent_state.step_index}",
+                    evidence=restrained_ev,
+                    assertions=assertion_rules,
+                )
+                return restrained_action, restrained_ev, restrained_v, 0, AgentStatus.VERIFIED
+
+            # If DELAYED: bounded second probe call within budget
+            if probe_status == "DELAYED":
+                try:
+                    probe_res_2 = probe_callback(tool_name, original_params, 2)
+                    status_2 = probe_res_2.get("status") if isinstance(probe_res_2, dict) else ("PRESENT" if probe_res_2 else "ABSENT")
+                    if status_2 == "PRESENT":
+                        timeline.emit("RESTRAINT_OBSERVED", {
+                            "reason": "Step 2 delayed probe confirmed state PRESENT; avoided duplicate write.",
+                        })
+                        self._record_action_success()
+                        self.agent_state.status = AgentStatus.VERIFIED
+                        restrained_action = ActionResult(
+                            tool_name=tool_name,
+                            success=True,
+                            output="Restrained: delayed probe confirmed state PRESENT.",
+                        )
+                        restrained_ev = Evidence(source="probe_restraint", facts={"success": True, "observed_existing_state": True})
+                        restrained_v = self.verifier.verify(
+                            recovery_decision_id=f"restraint-delayed-step-{self.agent_state.step_index}",
+                            evidence=restrained_ev,
+                            assertions=assertion_rules,
+                        )
+                        return restrained_action, restrained_ev, restrained_v, 0, AgentStatus.VERIFIED
+                    probe_status = status_2
+                except Exception as e:
+                    timeline.emit("AMBIGUITY_PROBE_FAILED", {"error": str(e)})
+                    self.agent_state.status = AgentStatus.ESCALATED
+                    self.reliability_state.escalations += 1
+                    dummy = ActionResult(tool_name=tool_name, success=False, error=f"DelayedProbeError: {type(e).__name__}: {str(e)}")
+                    esc_ev = self.evidence_collector.collect_from_action(dummy)
+                    esc_v = self.verifier.verify(
+                        recovery_decision_id=f"step-{self.agent_state.step_index}-escalation-probe2",
+                        evidence=esc_ev,
+                        assertions=assertion_rules,
+                    )
+                    return dummy, esc_ev, esc_v, 0, AgentStatus.ESCALATED
+
+            # Safety gate for retry on non-idempotent operations:
+            tool_obj = self.tool_registry.get_tool(tool_name)
+            is_idempotent = supports_idempotency if supports_idempotency is not None else getattr(tool_obj, "supports_idempotency_key", False)
+            is_confirmed_absent = (probe_status == "CONFIRMED_ABSENT")
+
+            if not is_idempotent and not is_confirmed_absent:
+                # Ambiguous non-idempotent operation without authoritative absence confirmation -> FAIL CLOSED
+                reason = f"NonIdempotentOperationAmbiguous: {tool_name} cannot be verified absent (probe_status={probe_status}); retry prohibited."
+                timeline.emit("SAFETY_GATE_BLOCKED_RETRY", {"reason": reason})
+                self.agent_state.status = AgentStatus.ESCALATED
+                self.reliability_state.escalations += 1
+                dummy = ActionResult(tool_name=tool_name, success=False, error=reason)
+                esc_ev = self.evidence_collector.collect_from_action(dummy)
+                esc_v = self.verifier.verify(
+                    recovery_decision_id=f"step-{self.agent_state.step_index}-safety-gate",
+                    evidence=esc_ev,
+                    assertions=assertion_rules,
+                )
+                return dummy, esc_ev, esc_v, 0, AgentStatus.ESCALATED
+
+        # ── Restraint Check: environmental state files ─────────────────────
         state_rules = [
             r for r in assertion_rules
             if r.assertion_type in ("FILE_EXISTS", "FILE_CONTAINS", "FILE_SIZE_GTE")
@@ -611,6 +720,54 @@ class ReAgentPipeline:
                     output="Restrained: environment state already verified.",
                 )
                 return dummy_verified_action, probe_evidence, probe_res, 0, AgentStatus.VERIFIED
+
+
+        # ── Fast-path Safe Retry for Verified Ambiguity Recovery ──────────
+        # When probe_callback confirmed absence (or tool is idempotent) and max_attempts > 0,
+        # execute the safe recovery retry directly under the frozen contract, bounded by max_attempts.
+        if probe_callback is not None:
+            if max_attempts > 0:
+                rec_action = self.tool_registry.execute_tool(tool_name, original_params)
+                self._append_execution_event(task.task_id, tool_name, original_params, rec_action)
+                recovery_count = 1
+                timeline.emit(PHASE_RECOVERY_EXECUTED, {
+                    "attempt": 1,
+                    "tool": tool_name,
+                    "success": rec_action.success,
+                })
+                rec_evidence = self.evidence_collector.collect_from_action(rec_action)
+                timeline.emit(PHASE_EVIDENCE_COLLECTED, {"evidence_id": rec_evidence.evidence_id})
+                rec_v_res = self.verifier.verify(
+                    recovery_decision_id=f"recovery-1-step-{self.agent_state.step_index}",
+                    evidence=rec_evidence,
+                    assertions=assertion_rules,
+                )
+                timeline.emit(PHASE_REVERIFICATION, {
+                    "attempt": 1,
+                    "verified": rec_v_res.verified,
+                    "discrepancies": rec_v_res.discrepancies,
+                })
+                if rec_v_res.verified:
+                    self.reliability_state.successful_recoveries += 1
+                    self.agent_state.failure_streak = 0
+                    self.agent_state.status = AgentStatus.VERIFIED
+                    self.policy_guard.reset_task(task.task_id)
+                    return rec_action, rec_evidence, rec_v_res, 1, AgentStatus.VERIFIED
+                else:
+                    self.agent_state.status = AgentStatus.FAILED
+                    self.reliability_state.total_failures += 1
+                    return rec_action, rec_evidence, rec_v_res, 1, AgentStatus.FAILED
+            else:
+                self.agent_state.status = AgentStatus.ESCALATED
+                self.reliability_state.escalations += 1
+                dummy = ActionResult(tool_name=tool_name, success=False, error="RecoveryBudgetExhausted")
+                esc_ev = self.evidence_collector.collect_from_action(dummy)
+                esc_v = self.verifier.verify(
+                    recovery_decision_id=f"step-{self.agent_state.step_index}-budget-exhausted",
+                    evidence=esc_ev,
+                    assertions=assertion_rules,
+                )
+                return dummy, esc_ev, esc_v, 0, AgentStatus.ESCALATED
 
         for attempt in range(max_attempts):
             # Build failure event for diagnosis
