@@ -38,6 +38,16 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# Load .env if present (gitignored) — lets operators set NEBIUS_API_KEY in a
+# local file without exporting it as a shell variable every session.
+# override=False: existing shell env vars always win over .env values.
+# Never committed — covered by *.env in .gitignore.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(dotenv_path=_REPO_ROOT / ".env", override=False)
+except ImportError:
+    pass  # python-dotenv not available; fall back to pure shell env
+
 from reagent.benchmark import run_benchmark_scenarios, BenchmarkComparisonReport
 from reagent.experiments.dbops.recovery_demo import run_demonstration, DemoArtifact, ArmResult
 from reagent.experiments.dbops.multi_scenario_demo import run_multi_scenario_demonstration, SCENARIO_CONFIGS
@@ -2063,9 +2073,23 @@ def generate_dashboard_html(
         <tr><td style="color:var(--text-dim); padding:4px 0;">Live calls on load</td><td><code style="color:var(--success);">Zero — only on explicit operator action</code></td></tr>
         <tr><td style="color:var(--text-dim); padding:4px 0;">NEBIUS_API_KEY</td><td id="preflightKeyStatus">{_preflight_key_html}</td></tr>
         <tr><td style="color:var(--text-dim); padding:4px 0;">Current Runtime Status</td><td id="runtimeStatusCell">{'<span style="color:var(--success);font-weight:700;">● READY</span> &mdash; explicit operator proposal authorized' if api_key_set else '<span style="color:var(--danger);font-weight:700;">● UNCONFIGURED</span> &mdash; Authorization Required (fails closed)'}</td></tr>
-        <tr><td style="color:var(--text-dim); padding:4px 0;">Historical Smoke Test Evidence</td><td><code style="color:var(--text-muted);">PASS &mdash; 768 tokens, 3644 ms, 337 in / 342 out (verified 2026-10-15 via Nebius Token Factory)</code></td></tr>
+        <tr><td style="color:var(--text-dim); padding:4px 0;">Historical Evidence (2026-10-15)</td><td><code style="color:var(--text-muted);">PASS &mdash; 768 tokens, 3644 ms, 337 in / 342 out (verified 2026-10-15 via Nebius Token Factory; not a current live result)</code></td></tr>
         <tr><td style="color:var(--text-dim); padding:4px 0;">Execution Authority</td><td><code style="color:var(--warning);">ADVISORY ONLY &mdash; model proposal cannot execute tools or declare success</code></td></tr>
       </table>
+
+      {'<!-- key configured: no setup instructions needed -->' if api_key_set else '''
+      <div style="background:#1a1000; border:1px solid #7c4a00; border-radius:8px; padding:14px 18px; margin:12px 0; font-size:12px; line-height:1.8;">
+        <div style="font-weight:700; color:#f59e0b; margin-bottom:8px;">&#x26a0; NEBIUS_API_KEY not configured &mdash; live inference disabled (fails closed)</div>
+        <div style="color:#cbd5e1; margin-bottom:10px;">To enable one live Nemotron request, configure your key using <strong>one</strong> of these methods:</div>
+        <div style="margin-bottom:6px; color:#94a3b8; font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.4px;">Option 1 &mdash; Local .env file (recommended, gitignored)</div>
+        <pre style="background:#0d1117; border:1px solid #263348; border-radius:5px; padding:9px 12px; font-size:11.5px; color:#38bdf8; margin:0 0 10px; overflow-x:auto;">echo NEBIUS_API_KEY=your_key_here &gt; D:\\ReAgent\\.env
+# Then restart the server: python -m reagent.ui_server</pre>
+        <div style="margin-bottom:6px; color:#94a3b8; font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.4px;">Option 2 &mdash; Shell environment variable (PowerShell)</div>
+        <pre style="background:#0d1117; border:1px solid #263348; border-radius:5px; padding:9px 12px; font-size:11.5px; color:#38bdf8; margin:0 0 10px; overflow-x:auto;">$env:NEBIUS_API_KEY = "your_key_here"
+python -m reagent.ui_server</pre>
+        <div style="color:#64748b; font-size:11px;">&#x2022; Key is never printed, logged, committed, or sent to any endpoint other than the official Nebius Token Factory.<br>&#x2022; The .env file is covered by *.env in .gitignore &mdash; it will never be committed.<br>&#x2022; Live inference is only triggered on explicit operator action &mdash; never on page load.</div>
+      </div>
+      '''}
 
       <div id="nemotronResult" style="display:none; margin-top:14px;">
         <div id="nemotronBadge" style="margin-bottom:10px; font-weight:700;"></div>
@@ -2968,7 +2992,7 @@ async function runNemotronPropose() {{
 
     const st = data.status || 'unknown';
     if (st === 'NOT_CONFIGURED') {{
-      badge.innerHTML = '<span style="color:var(--warning);font-weight:700;">&#x26a0; NOT CONFIGURED</span> &mdash; NEBIUS_API_KEY not set. Live inference refused (fails closed).';
+      badge.innerHTML = '<span style="color:var(--warning);font-weight:700;">&#x26a0; NOT CONFIGURED</span> &mdash; NEBIUS_API_KEY not set. Live inference refused (fails closed). Set key in <code>D:\\ReAgent\\.env</code> and restart server to enable.';
     }} else if (st === 'CONTRACT_VALIDATED') {{
       _latestNemotronProposal = data;
       badge.innerHTML = '<span style="color:var(--success);font-weight:700;">&#x2713; LIVE INFERENCE &mdash; CONTRACT VALIDATED &amp; GROUNDED</span>' +
