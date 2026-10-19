@@ -110,21 +110,27 @@ python -m venv reagent_env
 pip install -r requirements.txt
 ```
 
-### 1. Run the Unified Terminal Judge Demo (<4 seconds)
+### 1. Launch Interactive Mission Control (One-Command Quickstart)
 ```powershell
-python -m reagent.experiments.dbops.judge_demo
-```
-**What this demonstrates:**
-- **Part 1 — Live Recovery Demonstration**: Executes Task 02 ($500 wallet transfer) under an injected `COMMIT_THEN_TIMEOUT` fault on fresh disposable SQLite databases.
-  - *Naive Retry Baseline*: Double-debits $1,000 across 2 rows, draining account to $0.00 (`UNVERIFIED_CORRUPTED`).
-  - *ReAgent Layer*: Probes independently, verifies committed state, restrains retry, and preserves single $500 debit (`VERIFIED`).
-- **Part 2 — 480-Trial Comparative Benchmark**: Evaluates all 5 policy arms with full denominator integrity.
+# Windows PowerShell:
+.\launch_demo.ps1
 
-### 2. Launch the Interactive Mission Control Dashboard
-```powershell
-python reagent/ui_server.py --port 8080
+# Or cross-platform Python:
+python launch_demo.py
 ```
 Open your browser at **`http://127.0.0.1:8080/`**.
+- To automatically launch and open your default browser: `python launch_demo.py --open`
+- To run the fast 4-second terminal judge demo: `python launch_demo.py --cli`
+- To run release-gate verification checks: `python launch_demo.py --check`
+
+### 2. Alternative Direct Commands
+```powershell
+# Direct UI server launch:
+python reagent/ui_server.py --port 8080
+
+# Direct CLI judge demo:
+python -m reagent.experiments.dbops.judge_demo
+```
 
 #### Five Recovery Scenarios Demonstrated:
 - **Scenario A (Normal Success)**: Clean execution. Both agents execute once; ReAgent independently observes and verifies postconditions.

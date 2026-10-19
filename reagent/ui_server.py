@@ -3238,10 +3238,11 @@ def start_server(port: int = 8080):
     print(f"\n==================================================================")
     print(f"      ReAgent Mission Control Server -> http://127.0.0.1:{port}/")
     print(f"==================================================================")
-    print(f" Tagline     : \"ReAgent doesn't trust 'done.' It verifies it.\"")
+    print(f" Headline    : \"A timeout isn't a no.\"")
+    print(f" Principle   : \"Unknown is not absent.\"")
     print(f" Provenance  : OFFLINE · DETERMINISTIC FIXTURES (Isolated SQLite)")
     print(f" Scenarios   : A (Normal) / B (Timeout) / C (Fail-before) / D (Unknown) / E (Partial)")
-    print(f" Network     : ZERO External Calls / ZERO Live Provider Dispatches")
+    print(f" Network     : ZERO External Calls on Load / 100% Offline Demo Ready")
     print(f" Press Ctrl+C to stop.\n")
     try:
         server.serve_forever()
