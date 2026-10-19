@@ -55,7 +55,7 @@ ReAgent acts as an intermediary reliability layer between LLM agents and underly
 ### Accomplishments That We're Proud Of
 - **0.0% False Verification Rate**: Across 480 paired trials, ReAgent achieved zero false verifications, compared to a **44.8% false verification rate** for shallow presence checking (`SHARED_OBSERVATION`) and **66.7%** for Naive Retry.
 - **Complete Elimination of Duplicate Debits**: While Naive Retry caused 24 unsafe retries resulting in 4 primary duplicate debits and 5 audit duplicates, ReAgent caused **zero duplicate writes**.
-- **583 Tests Passing (11 skipped)**: Comprehensive test suite covering recovery invariants, pipeline contracts, UI endpoints, and adversarial review.
+- **584 Tests Passing (11 skipped)**: Comprehensive test suite covering recovery invariants, pipeline contracts, UI endpoints, and adversarial review.
 - **Zero-Dependency Judge Application**: An interactive browser UI and terminal demo that run in ~3.8 seconds without requiring API keys or external networks.
 
 ### What We Learned

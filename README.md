@@ -189,7 +189,7 @@ python -m pytest tests/test_ui_server.py -v
 ```
 
 **Results:**
-- **583 Tests Passing** (11 skipped)
+- **584 Tests Passing** (11 skipped)
 - **0 Failures / 0 Errors**
 - **Network Calls:** **ZERO** (Strictly offline)
 
