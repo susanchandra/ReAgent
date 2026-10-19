@@ -44,6 +44,7 @@ htmlcov/
 # Temp / scratch
 *.tmp
 *.bak
+scratch*.py
 hlib
 
 # Ledger files, locks, and atomic temp files (runtime state, NOT source controlled)
