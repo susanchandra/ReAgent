@@ -1339,11 +1339,42 @@ def generate_dashboard_html(
       border: 1px solid var(--border);
       border-radius: 6px;
       padding: 9px 12px;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
       font-size: 11.5px;
       display: flex;
       justify-content: space-between;
       gap: 10px;
+    }}
+
+    .outcome-policy-box {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+      font-size: 11px;
+    }}
+    .policy-pill {{
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 7px 10px;
+    }}
+    .policy-pill-label {{
+      font-size: 9.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-dim);
+      margin-bottom: 3px;
+    }}
+    .policy-pill-val {{
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }}
 
     .ledger-rows {{
@@ -1737,6 +1768,18 @@ def generate_dashboard_html(
               <span style="color:var(--text-dim);">Observed After: <strong id="naiveAfterState" style="color:var(--text); font-family:var(--mono);">Awaiting Run</strong></span>
             </div>
 
+            <!-- Policy & Certainty Summary -->
+            <div class="outcome-policy-box">
+              <div class="policy-pill">
+                <div class="policy-pill-label">Retry Policy</div>
+                <div class="policy-pill-val" style="color:var(--danger);" id="naivePolicyVal">BLIND RETRY</div>
+              </div>
+              <div class="policy-pill">
+                <div class="policy-pill-label">Outcome Certainty</div>
+                <div class="policy-pill-val" style="color:var(--text-muted);" id="naiveCertaintyVal">UNVERIFIED ASSUMPTION</div>
+              </div>
+            </div>
+
             <div class="wallet">
               <div class="wallet-label" id="naiveEntityLabel">Balance — ACCT-2201 (Isolated World A)</div>
               <div class="wallet-balance neutral" id="naiveBal">$1,000.00</div>
@@ -1789,6 +1832,18 @@ def generate_dashboard_html(
             <div class="state-compare-box">
               <span style="color:var(--text-dim);">Initial Fixture: <strong id="reagentBeforeState" style="color:var(--text); font-family:var(--mono);">$1,000.00 (0 rows)</strong></span>
               <span style="color:var(--text-dim);">Observed After: <strong id="reagentAfterState" style="color:var(--text); font-family:var(--mono);">Awaiting Run</strong></span>
+            </div>
+
+            <!-- Policy & Certainty Summary -->
+            <div class="outcome-policy-box">
+              <div class="policy-pill">
+                <div class="policy-pill-label">Recovery Policy</div>
+                <div class="policy-pill-val" style="color:var(--success);" id="reagentPolicyVal">STATE-GOVERNED RECOVERY</div>
+              </div>
+              <div class="policy-pill">
+                <div class="policy-pill-label">Outcome Certainty</div>
+                <div class="policy-pill-val" style="color:var(--accent);" id="reagentCertaintyVal">INDEPENDENT PROBE</div>
+              </div>
             </div>
 
             <div class="wallet">
@@ -1988,10 +2043,16 @@ def generate_dashboard_html(
           Live inference only on explicit operator action — zero calls on page load.
         </div>
       </div>
-      <button class="btn btn-primary" id="btnNemotronPropose" onclick="runNemotronPropose()"
-        {'disabled title="NEBIUS_API_KEY not set — live inference refused (fails closed)"' if nemotron_status == 'NOT_CONFIGURED' else 'title="Click to send one live inference request to Nebius Nemotron"'}>
-        🤖 Run Real Nemotron Contract Proposal
-      </button>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+        <button class="btn btn-primary" id="btnNemotronPropose" onclick="runNemotronPropose()"
+          {'disabled title="NEBIUS_API_KEY not set — live inference refused (fails closed)"' if nemotron_status == 'NOT_CONFIGURED' else 'title="Click to send one live inference request to Nebius Nemotron"'}>
+          🤖 Run Real Nemotron Contract Proposal
+        </button>
+        <button class="btn btn-neutral" id="btnPreviewReference" onclick="previewOfflineReferenceProposal()"
+          title="Inspect grounded reference proposal without API keys (offline demo)">
+          📋 Preview Verified Reference Proposal (Offline Demo)
+        </button>
+      </div>
     </div>
     <div class="card-body">
       <table style="font-size:12px; width:100%; margin-bottom:14px;">
@@ -2051,12 +2112,17 @@ let _replayIdx = 0;
 let _replayTimer = null;
 let _taskValid = true;
 
-function showTab(tabId, btn) {{
+function switchTab(tabId) {{
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   const target = document.getElementById(tabId);
   if (target) target.classList.add('active');
+  const btn = document.querySelector(`.tab-btn[onclick*="${{tabId}}"]`);
   if (btn) btn.classList.add('active');
+}}
+
+function showTab(tabId, btn) {{
+  switchTab(tabId);
 }}
 
 function renderScenarioCards() {{
@@ -2364,6 +2430,74 @@ function updateLanes(result) {{
     rRat.style.color = 'var(--text-muted)';
   }}
 
+  // Policy & Certainty Pills
+  const nPol = document.getElementById('naivePolicyVal');
+  const nCert = document.getElementById('naiveCertaintyVal');
+  const rPol = document.getElementById('reagentPolicyVal');
+  const rCert = document.getElementById('reagentCertaintyVal');
+
+  if (nPol && nCert) {{
+    if (n.duplicate_occurred) {{
+      nPol.innerText = 'BLIND RETRY (NO PROBE)';
+      nPol.style.color = 'var(--danger)';
+      nCert.innerText = 'UNVERIFIED CORRUPTED (DUP)';
+      nCert.style.color = 'var(--danger)';
+    }} else if (n.final_status === 'VERIFIED') {{
+      nPol.innerText = 'TRUST TOOL RETURN';
+      nPol.style.color = 'var(--text-muted)';
+      nCert.innerText = 'UNVERIFIED SUCCESS';
+      nCert.style.color = 'var(--text-muted)';
+    }} else {{
+      nPol.innerText = 'BLIND RETRY ON FAULT';
+      nPol.style.color = 'var(--warning)';
+      nCert.innerText = n.final_status;
+      nCert.style.color = 'var(--warning)';
+    }}
+  }}
+
+  if (rPol && rCert) {{
+    if (ragStatus === 'VERIFIED') {{
+      if (_currentScenario === 'B') {{
+        rPol.innerText = 'REPRESS RETRY (RESTRAINED)';
+        rPol.style.color = 'var(--success)';
+        rCert.innerText = 'CONFIRMED COMMITTED';
+        rCert.style.color = 'var(--success)';
+      }} else if (_currentScenario === 'C') {{
+        rPol.innerText = 'SAFE RETRY (EXACTLY ONCE)';
+        rPol.style.color = 'var(--accent)';
+        rCert.innerText = 'CONFIRMED ABSENT';
+        rCert.style.color = 'var(--accent)';
+      }} else {{
+        rPol.innerText = 'VERIFY & COMPLETE';
+        rPol.style.color = 'var(--success)';
+        rCert.innerText = 'CONFIRMED SUCCESS';
+        rCert.style.color = 'var(--success)';
+      }}
+    }} else if (ragStatus === 'ESCALATED') {{
+      if (_currentScenario === 'D') {{
+        rPol.innerText = 'ESCALATE (UNKNOWN != ABSENT)';
+        rPol.style.color = 'var(--warning)';
+        rCert.innerText = 'UNKNOWN (PROBE DOWN)';
+        rCert.style.color = 'var(--warning)';
+      }} else if (_currentScenario === 'E') {{
+        rPol.innerText = 'HALT & ESCALATE';
+        rPol.style.color = 'var(--warning)';
+        rCert.innerText = 'PARTIAL COMMIT DETECTED';
+        rCert.style.color = 'var(--danger)';
+      }} else {{
+        rPol.innerText = 'SAFE ESCALATION';
+        rPol.style.color = 'var(--warning)';
+        rCert.innerText = 'AMBIGUOUS / UNKNOWN';
+        rCert.style.color = 'var(--warning)';
+      }}
+    }} else {{
+      rPol.innerText = 'FAIL-CLOSED';
+      rPol.style.color = 'var(--danger)';
+      rCert.innerText = ragStatus;
+      rCert.style.color = 'var(--danger)';
+    }}
+  }}
+
   setBadge('naiveStatusBadge', n.final_status, n.duplicate_occurred);
   setBadge('reagentStatusBadge', ragStatus, false);
 
@@ -2633,6 +2767,14 @@ function resetLanes() {{
     const el = document.getElementById(id);
     if (el) el.innerText = '—';
   }});
+  const nPol = document.getElementById('naivePolicyVal');
+  const nCert = document.getElementById('naiveCertaintyVal');
+  const rPol = document.getElementById('reagentPolicyVal');
+  const rCert = document.getElementById('reagentCertaintyVal');
+  if (nPol) {{ nPol.innerText = 'BLIND RETRY'; nPol.style.color = 'var(--danger)'; }}
+  if (nCert) {{ nCert.innerText = 'UNVERIFIED ASSUMPTION'; nCert.style.color = 'var(--text-muted)'; }}
+  if (rPol) {{ rPol.innerText = 'STATE-GOVERNED RECOVERY'; rPol.style.color = 'var(--success)'; }}
+  if (rCert) {{ rCert.innerText = 'INDEPENDENT PROBE'; rCert.style.color = 'var(--accent)'; }}
 }}
 
 
@@ -2729,21 +2871,82 @@ function downloadReceipt() {{
 let _latestNemotronProposal = null;
 let _activeModelContract = null;
 
+const REFERENCE_NEMOTRON_PROPOSAL = {{
+  status: "CONTRACT_VALIDATED",
+  run_id: "ref_smoke_inv9842_offline",
+  model: "{DEFAULT_MODEL}",
+  endpoint_host: "api.tokenfactory.nebius.com",
+  latency_ms: 3644,
+  input_tokens: 337,
+  output_tokens: 342,
+  token_source: "PROVIDER_REPORTED",
+  schema_valid: true,
+  grounding_valid: true,
+  canonical_output_hash: "c78956a04f57b6e46ef00a1a",
+  is_live: false,
+  provenance: "OFFLINE_REFERENCE_PROPOSAL",
+  failure_reason: null,
+  contract: {{
+    tool: "inventory_read_only",
+    arguments: {{
+      item_id: "INV-ITEM-9842",
+      warehouse_code: "WH-A12",
+      location: "WH-A12"
+    }},
+    proposed_postconditions: [
+      {{
+        predicate: "STATUS_SUCCESS",
+        description: "Verify fictional inventory item INV-ITEM-9842 in WH-A12 has quantity 42 units IN_STOCK."
+      }}
+    ],
+    diagnosis_category: null,
+    diagnosis_confidence: 0.0,
+    diagnosis_reason: null,
+    recovery_strategy: null
+  }}
+}};
+
+function previewOfflineReferenceProposal() {{
+  const result = document.getElementById('nemotronResult');
+  const badge = document.getElementById('nemotronBadge');
+  const meta = document.getElementById('nemotronMeta');
+  const output = document.getElementById('nemotronOutput');
+
+  _latestNemotronProposal = REFERENCE_NEMOTRON_PROPOSAL;
+  result.style.display = 'block';
+  badge.innerHTML = '<span style="color:var(--accent);font-weight:700;">📋 OFFLINE REFERENCE PROPOSAL &mdash; GROUNDED &amp; VERIFIED</span> ' +
+    '<span style="font-size:11px; color:var(--text-dim);">(Pre-computed from 2026-10-15 Token Factory smoke test &mdash; 0 tokens / 0 network calls)</span>' +
+    '<div style="margin-top:10px;"><button class="btn btn-primary" id="btnAdoptModelContract" onclick="adoptModelContract()" style="font-size:12px; font-weight:600; padding:6px 14px;">▶ Load Proposal into Mission Control Simulation</button></div>';
+
+  const lines = [
+    'Run ID: ' + REFERENCE_NEMOTRON_PROPOSAL.run_id,
+    'Model: ' + REFERENCE_NEMOTRON_PROPOSAL.model,
+    'Endpoint: ' + REFERENCE_NEMOTRON_PROPOSAL.endpoint_host,
+    'Latency: ' + REFERENCE_NEMOTRON_PROPOSAL.latency_ms + ' ms',
+    'Tokens: 337 in / 342 out (Token Factory)',
+    'Schema: &#x2713; valid',
+    'Grounding: &#x2713; valid',
+    'Is Live: False (Offline Reference)'
+  ];
+  meta.innerHTML = lines.join(' &nbsp;|&nbsp; ');
+  output.innerText = JSON.stringify(REFERENCE_NEMOTRON_PROPOSAL.contract, null, 2);
+}}
+
 function adoptModelContract() {{
   if (!_latestNemotronProposal) return;
   _activeModelContract = _latestNemotronProposal;
-  switchTab('simulation-tab');
+  switchTab('mc-tab');
   const bar = document.getElementById('scenarioBar');
   if (bar) {{
     let note = document.getElementById('modelContractNotice');
     if (!note) {{
       note = document.createElement('div');
       note.id = 'modelContractNotice';
-      note.style.cssText = 'margin-top:8px; padding:6px 10px; background:rgba(99,102,241,0.15); border:1px solid var(--accent); border-radius:4px; font-size:11.5px; color:var(--text);';
+      note.style.cssText = 'margin-top:10px; padding:10px 14px; background:rgba(56,189,248,0.12); border:1px solid rgba(56,189,248,0.4); border-radius:6px; font-size:12px; color:var(--text);';
       bar.appendChild(note);
     }}
     const hash = (_activeModelContract.canonical_output_hash || 'proposal').slice(0, 16);
-    note.innerHTML = '🤖 <strong>Model Proposal Active:</strong> Using advisory contract proposal from NVIDIA Nemotron (<code style="color:var(--accent);">' + hash + '…</code>). ReAgent deterministic recovery policy governs all recovery actions.';
+    note.innerHTML = '🤖 <strong>Advisory Model Proposal Active:</strong> Structured contract loaded from NVIDIA Nemotron (<code style="color:var(--accent);">' + hash + '…</code>). ReAgent deterministic recovery policy governs all recovery actions.';
   }}
 }}
 
