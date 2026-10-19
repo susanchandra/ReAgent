@@ -1,442 +1,299 @@
 """
-Unit tests for ReAgent M6 UI Server (reagent/ui_server.py).
-Verifies:
-  - HTML export produces correct self-contained output
-  - Data normalization produces correct structure from benchmark records
-  - All displayed metrics derive from actual benchmark records (no fabrication)
-  - Export data and normalization data are consistent
-  - Missing fields are handled without fabrication
-  - Provenance is correctly labeled OFFLINE
-  - New BenchmarkRunTrace enrichment fields are present and typed correctly
+test_ui_server.py — Integration tests for ReAgent Judge UI Server.
+Tests HTTP handler endpoints, security boundaries, and recovery demo integration.
 """
 
-import os
 import json
+import threading
+import time
 import unittest
-import tempfile
-import shutil
+import urllib.request
+from http.server import HTTPServer
+from pathlib import Path
 
-_MODULE_TEMP_DIR = None
-_MODULE_PREV_LEDGER = None
-
-
-def setUpModule():
-    global _MODULE_TEMP_DIR, _MODULE_PREV_LEDGER
-    _MODULE_TEMP_DIR = tempfile.mkdtemp(prefix="reagent_ui_test_")
-    _MODULE_PREV_LEDGER = os.environ.get("REAGENT_LEDGER_PATH")
-    os.environ["REAGENT_LEDGER_PATH"] = os.path.join(_MODULE_TEMP_DIR, "ledger.json")
+from reagent.ui_server import DashboardHTTPHandler, generate_dashboard_html
 
 
-def tearDownModule():
-    global _MODULE_TEMP_DIR, _MODULE_PREV_LEDGER
-    if _MODULE_PREV_LEDGER is not None:
-        os.environ["REAGENT_LEDGER_PATH"] = _MODULE_PREV_LEDGER
-    else:
-        os.environ.pop("REAGENT_LEDGER_PATH", None)
-    if _MODULE_TEMP_DIR and os.path.exists(_MODULE_TEMP_DIR):
-        shutil.rmtree(_MODULE_TEMP_DIR, ignore_errors=True)
-
-
-from reagent.benchmark import run_benchmark_scenarios, BenchmarkRunTrace, BenchmarkComparisonReport
-from reagent.ui_server import generate_dashboard_html, _normalize_report, _status_meta
-
-
-class TestStatusMeta(unittest.TestCase):
-    """Tests that status metadata correctly maps to UI classes and labels."""
-
-    def test_verified(self):
-        m = _status_meta("VERIFIED")
-        self.assertEqual(m["css"], "verified")
-        self.assertEqual(m["label"], "VERIFIED")
-        self.assertIn("icon", m)
-
-    def test_escalated(self):
-        m = _status_meta("ESCALATED")
-        self.assertEqual(m["css"], "escalated")
-        self.assertEqual(m["label"], "ESCALATED")
-
-    def test_failed(self):
-        m = _status_meta("FAILED")
-        self.assertEqual(m["css"], "failed")
-
-    def test_false_success(self):
-        m = _status_meta("FALSE_SUCCESS")
-        self.assertEqual(m["css"], "false-success")
-        self.assertIn("FALSE", m["label"])
-
-    def test_unknown(self):
-        m = _status_meta("")
-        self.assertEqual(m["css"], "unknown")
-
-    def test_case_insensitive(self):
-        m = _status_meta("verified")
-        self.assertEqual(m["css"], "verified")
-
-
-class TestNormalizeReport(unittest.TestCase):
-    """Tests that _normalize_report produces a complete, accurate UI data structure."""
-
+class TestUIServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.report = run_benchmark_scenarios()
-        cls.data = _normalize_report(cls.report)
-
-    def test_provenance_is_offline(self):
-        self.assertIn("OFFLINE", self.data["provenance"])
-        self.assertIn("DETERMINISTIC", self.data["provenance"])
-
-    def test_provenance_note_present(self):
-        self.assertIsInstance(self.data["provenance_note"], str)
-        self.assertGreater(len(self.data["provenance_note"]), 10)
-
-    def test_scenarios_evaluated_matches_report(self):
-        self.assertEqual(self.data["scenarios_evaluated"], self.report.scenarios_evaluated)
-
-    def test_reagent_verified_matches_report(self):
-        self.assertEqual(self.data["reagent_verified_count"], self.report.reagent_verified_count)
-
-    def test_reagent_escalated_matches_report(self):
-        self.assertEqual(self.data["reagent_escalated_count"], self.report.reagent_escalated_count)
-
-    def test_reagent_false_success_matches_report(self):
-        self.assertEqual(self.data["reagent_false_success_count"], self.report.reagent_false_success_count)
-
-    def test_baseline_false_success_matches_report(self):
-        self.assertEqual(self.data["baseline_false_success_count"], self.report.baseline_false_success_count)
-
-    def test_runs_count(self):
-        self.assertEqual(len(self.data["runs"]), 10)
-
-    def test_reagent_runs_have_strategy_label(self):
-        reagent_runs = [r for r in self.data["runs"] if r["strategy"] == "reagent_diagnosis_guided"]
-        for r in reagent_runs:
-            self.assertEqual(r["strategy_label"], "ReAgent")
-
-    def test_baseline_runs_have_strategy_label(self):
-        baseline_runs = [r for r in self.data["runs"] if r["strategy"] == "naive_fixed_retry"]
-        for r in baseline_runs:
-            self.assertIn("Naive", r["strategy_label"])
-
-    def test_each_run_has_status_meta(self):
-        for r in self.data["runs"]:
-            self.assertIn("status_meta", r)
-            sm = r["status_meta"]
-            self.assertIn("css", sm)
-            self.assertIn("icon", sm)
-            self.assertIn("label", sm)
-
-    def test_scenario_ids_present(self):
-        ids = {r["scenario_id"] for r in self.data["runs"] if r["strategy"] == "reagent_diagnosis_guided"}
-        expected_ids = {
-            "SCENARIO_1_TRANSIENT_TOOL_FAILURE",
-            "SCENARIO_2_INVALID_MODEL_OUTPUT",
-            "SCENARIO_3_INCORRECT_ACTION_RESULT",
-            "SCENARIO_4_ENVIRONMENT_DEPENDENCY_FAILURE",
-            "SCENARIO_5_AUTHENTICATION_SECURITY_ESCALATION",
-        }
-        self.assertEqual(ids, expected_ids)
-
-    def test_run_has_required_fields(self):
-        for r in self.data["runs"]:
-            for field in ("scenario_id", "scenario_name", "fault_type", "strategy",
-                          "attempts_executed", "final_status", "verified",
-                          "duration_ms", "timeline_phases", "discrepancies"):
-                self.assertIn(field, r, f"Field '{field}' missing from run {r.get('scenario_id', '?')}")
-
-    def test_baseline_false_success_count_equals_one(self):
-        """Regression: baseline must produce exactly one FALSE_SUCCESS on scenario 3."""
-        self.assertEqual(self.data["baseline_false_success_count"], 1)
-
-    def test_reagent_false_success_count_equals_zero(self):
-        """Regression: ReAgent must never produce a FALSE_SUCCESS."""
-        self.assertEqual(self.data["reagent_false_success_count"], 0)
-
-
-class TestBenchmarkTraceEnrichment(unittest.TestCase):
-    """Tests that M6 enrichment fields are correctly populated in BenchmarkRunTrace."""
+        # Bind to port 0 to get an ephemeral free port
+        cls.server = HTTPServer(("127.0.0.1", 0), DashboardHTTPHandler)
+        cls.port = cls.server.server_address[1]
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        time.sleep(0.1)
 
     @classmethod
-    def setUpClass(cls):
-        cls.report = run_benchmark_scenarios()
-        cls.reagent_runs = [r for r in cls.report.runs if r.strategy == "reagent_diagnosis_guided"]
-        cls.baseline_runs = [r for r in cls.report.runs if r.strategy == "naive_fixed_retry"]
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
 
-    def test_reagent_runs_have_claimed_outcome(self):
-        for r in self.reagent_runs:
-            self.assertIsNotNone(r.claimed_outcome, f"claimed_outcome missing for {r.scenario_id}")
-            self.assertIn("tool_reported_success", r.claimed_outcome)
-            self.assertIn("tool_name", r.claimed_outcome)
+    def _url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.port}{path}"
 
-    def test_reagent_runs_have_observed_outcome(self):
-        for r in self.reagent_runs:
-            self.assertIsNotNone(r.observed_outcome, f"observed_outcome missing for {r.scenario_id}")
-            self.assertIn("verifier_verdict", r.observed_outcome)
-            self.assertIn("evidence_source", r.observed_outcome)
+    def test_01_index_html_renders_required_elements(self):
+        """GET / returns HTTP 200, required headline, problem statement, and safety invariant."""
+        req = urllib.request.Request(self._url("/"))
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            content_type = resp.headers.get("Content-Type", "")
+            self.assertIn("text/html", content_type)
+            html_text = resp.read().decode("utf-8")
 
-    def test_reagent_runs_have_frozen_contract_summary(self):
-        for r in self.reagent_runs:
-            if not r.contract_applicable:
-                self.assertIsNone(r.frozen_contract_summary)
-                continue
-            self.assertIsNotNone(r.frozen_contract_summary,
-                                 f"frozen_contract_summary missing for {r.scenario_id}")
-            fc = r.frozen_contract_summary
-            self.assertIn("contract_id", fc)
-            self.assertIn("provenance", fc)
-            self.assertIn("predicates", fc)
-            self.assertIsInstance(fc["predicates"], list)
-            self.assertGreater(len(fc["predicates"]), 0)
+        self.assertIn("ReAgent — Verify outcomes. Recover safely.", html_text)
+        self.assertIn("A tool can fail to report success even after its side effect has committed", html_text)
+        self.assertIn("UNKNOWN is not ABSENT", html_text)
+        self.assertIn("COMMIT_THEN_TIMEOUT", html_text)
+        self.assertIn("480-Trial Comparative Benchmark", html_text)
 
-    def test_reagent_runs_have_timeline_events(self):
-        for r in self.reagent_runs:
-            self.assertIsInstance(r.timeline_events, list)
-            self.assertGreater(len(r.timeline_events), 0,
-                               f"timeline_events empty for {r.scenario_id}")
-            for ev in r.timeline_events:
-                self.assertIn("phase", ev)
-                self.assertIn("detail", ev)
+    def test_02_health_endpoint(self):
+        """GET /api/health returns HTTP 200 and offline deterministic metadata."""
+        req = urllib.request.Request(self._url("/api/health"))
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
 
-    def test_reagent_runs_have_safe_receipt(self):
-        for r in self.reagent_runs:
-            if not r.contract_applicable:
-                self.assertIsNone(r.safe_receipt)
-                continue
-            self.assertIsNotNone(r.safe_receipt, f"safe_receipt missing for {r.scenario_id}")
-            sr = r.safe_receipt
-            for key in ("receipt_id", "task_id", "tool", "final_status", "verified"):
-                self.assertIn(key, sr)
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(data["mode"], "OFFLINE_DETERMINISTIC")
+        self.assertFalse(data["network_calls_allowed"])
+        self.assertIn("source_git_revision", data)
 
+    def test_03_recovery_demo_post_execution(self):
+        """POST /api/run_recovery_demo executes fresh demo and returns side-by-side comparison."""
+        req = urllib.request.Request(self._url("/api/run_recovery_demo"), method="POST")
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
 
-    def test_safe_receipt_contains_no_secrets(self):
-        """Verify safe_receipt does not contain raw error messages, model reasoning, or credential fields."""
-        forbidden_keys = {"api_key", "token", "authorization", "password", "secret",
-                          "raw_output", "model_reasoning", "exception_message"}
-        for r in self.reagent_runs:
-            if r.safe_receipt:
-                keys = {k.lower() for k in r.safe_receipt.keys()}
-                for fk in forbidden_keys:
-                    self.assertNotIn(fk, keys,
-                                     f"Forbidden key '{fk}' found in safe_receipt for {r.scenario_id}")
+        self.assertIn("naive_retry_arm", data)
+        self.assertIn("reagent_arm", data)
 
-    def test_claimed_observed_agreement_for_pipeline_verified_runs(self):
-        """
-        For pipeline-cycle VERIFIED runs (Sc1, Sc2): tool claimed success and verifier agrees.
-        Sc4 is excluded — it is VERIFIED via registry fallback, not execute_with_contract,
-        so the primary tool's claimed_success is False while the run is still VERIFIED.
-        """
-        pipeline_verified = [
-            r for r in self.reagent_runs
-            if r.final_status == "VERIFIED"
-            and r.scenario_id != "SCENARIO_4_ENVIRONMENT_DEPENDENCY_FAILURE"
-        ]
-        for r in pipeline_verified:
-            self.assertTrue(r.claimed_outcome["tool_reported_success"],
-                            f"Verified run {r.scenario_id} has claimed_success=False")
-            self.assertEqual(r.observed_outcome["verifier_verdict"], "PASS",
-                             f"Verified run {r.scenario_id} has verifier_verdict != PASS")
+        naive = data["naive_retry_arm"]
+        reagent = data["reagent_arm"]
 
+        # Starting balances equal
+        self.assertEqual(naive["starting_balance"], 1000.0)
+        self.assertEqual(reagent["starting_balance"], 1000.0)
 
-    def test_scenario3_false_success_correctly_labeled(self):
-        """Scenario 3 baseline must be FALSE_SUCCESS; ReAgent must be ESCALATED or not VERIFIED."""
-        sc3_reagent = next((r for r in self.reagent_runs if r.scenario_id == "SCENARIO_3_INCORRECT_ACTION_RESULT"), None)
-        sc3_baseline = next((r for r in self.baseline_runs if r.scenario_id == "SCENARIO_3_INCORRECT_ACTION_RESULT"), None)
-        self.assertIsNotNone(sc3_reagent)
-        self.assertIsNotNone(sc3_baseline)
-        self.assertNotEqual(sc3_reagent.final_status, "VERIFIED",
-                            "Scenario 3 ReAgent should NOT be VERIFIED — required key is missing")
-        self.assertEqual(sc3_baseline.final_status, "FALSE_SUCCESS",
-                         "Scenario 3 baseline should be FALSE_SUCCESS")
+        # Naive double debit
+        self.assertEqual(naive["tool_attempts"], 2)
+        self.assertEqual(naive["ledger_records_count"], 2)
+        self.assertEqual(naive["net_transferred"], 1000.0)
+        self.assertEqual(naive["final_balance"], 0.0)
+        self.assertTrue(naive["duplicate_occurred"])
+        self.assertEqual(naive["final_status"], "UNVERIFIED_CORRUPTED")
 
-    def test_timeline_events_no_secrets(self):
-        """Timeline event details must not contain credential-like fields."""
-        forbidden = {"api_key", "token", "authorization", "password", "bearer"}
-        for r in self.reagent_runs:
-            for ev in r.timeline_events:
-                for k in ev.get("detail", {}).keys():
-                    self.assertNotIn(k.lower(), forbidden,
-                                     f"Forbidden key '{k}' in timeline event {ev['phase']} for {r.scenario_id}")
+        # ReAgent single debit preserved
+        self.assertEqual(reagent["tool_attempts"], 1)
+        self.assertEqual(reagent["probe_queries"], 1)
+        self.assertEqual(reagent["ledger_records_count"], 1)
+        self.assertEqual(reagent["net_transferred"], 500.0)
+        self.assertEqual(reagent["final_balance"], 500.0)
+        self.assertFalse(reagent["duplicate_occurred"])
+        self.assertEqual(reagent["final_status"], "VERIFIED")
 
-    def test_baseline_claimed_outcome_present(self):
-        for r in self.baseline_runs:
-            self.assertIsNotNone(r.claimed_outcome,
-                                 f"claimed_outcome missing for baseline {r.scenario_id}")
-            self.assertIn("tool_reported_success", r.claimed_outcome)
+    def test_04_benchmark_endpoint(self):
+        """GET /api/benchmark returns 480-trial benchmark data."""
+        req = urllib.request.Request(self._url("/api/benchmark"))
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
 
-    def test_baseline_observed_outcome_has_no_verifier(self):
-        for r in self.baseline_runs:
-            self.assertIsNotNone(r.observed_outcome)
-            src = r.observed_outcome.get("evidence_source", "")
-            self.assertIn("no_verifier", src,
-                          f"Baseline {r.scenario_id} evidence_source should indicate no verifier: got '{src}'")
+        self.assertEqual(data["total_paired_configurations"], 480)
+        self.assertIn("REAGENT_CONTRACT", data["arm_aggregates"])
 
+    def test_05_security_and_404_handling(self):
+        """Non-existent paths and traversal attempts fail closed with HTTP 404."""
+        for bad_path in ("/unknown_route", "/../../../etc/passwd", "/reagent/../.env"):
+            req = urllib.request.Request(self._url(bad_path))
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req)
+            self.assertEqual(ctx.exception.code, 404)
 
-class TestHTMLExport(unittest.TestCase):
-    """Tests that HTML export produces valid, complete, self-contained output."""
+    def test_06_generate_dashboard_html_function(self):
+        """generate_dashboard_html produces standalone string without errors."""
+        html_out = generate_dashboard_html()
+        self.assertIsInstance(html_out, str)
+        self.assertGreater(len(html_out), 1000)
 
-    @classmethod
-    def setUpClass(cls):
-        cls.report = run_benchmark_scenarios()
-        cls.html = generate_dashboard_html(cls.report)
+    def test_07_html_contains_offline_button_label(self):
+        """GET / dashboard contains 'Run Recovery Simulation' button label (offline mode)."""
+        req = urllib.request.Request(self._url("/"))
+        with urllib.request.urlopen(req) as resp:
+            html_text = resp.read().decode("utf-8")
+        self.assertIn("Run Recovery Simulation", html_text)
+        # Old label 'Run Live Simulation' must not appear as the button default label
+        # (it may still appear in JS reset code — we specifically check the HTML button span)
+        self.assertNotIn("Run Live Simulation</span>", html_text)
 
-    def test_html_is_string(self):
-        self.assertIsInstance(self.html, str)
+    def test_08_successive_posts_return_unique_run_ids(self):
+        """Two successive POST /api/run_recovery_demo calls return different run_ids."""
+        def do_post():
+            req = urllib.request.Request(self._url("/api/run_recovery_demo"), method="POST")
+            with urllib.request.urlopen(req) as resp:
+                return json.loads(resp.read().decode("utf-8"))
 
-    def test_html_length_reasonable(self):
-        # A minimal complete UI should be at least 50KB
-        self.assertGreater(len(self.html), 50_000)
+        result1 = do_post()
+        time.sleep(0.05)  # ensure clock advances
+        result2 = do_post()
 
-    def test_html_is_complete(self):
-        self.assertIn("<!DOCTYPE html>", self.html)
-        self.assertIn("</html>", self.html)
+        self.assertIn("run_id", result1, "run_id missing from first response")
+        self.assertIn("run_id", result2, "run_id missing from second response")
+        self.assertNotEqual(result1["run_id"], result2["run_id"],
+                            "Successive calls must return distinct run_id values")
 
-    def test_report_json_embedded(self):
-        self.assertIn("reagent_verified_count", self.html)
-        self.assertIn("OFFLINE", self.html)
+    def test_09_run_id_format_and_duration(self):
+        """POST /api/run_recovery_demo returns run_id in expected format and non-negative duration."""
+        req = urllib.request.Request(self._url("/api/run_recovery_demo"), method="POST")
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
 
-    def test_provenance_note_embedded(self):
-        self.assertIn("OFFLINE", self.html)
-        self.assertIn("DETERMINISTIC", self.html)
+        run_id = data.get("run_id", "")
+        self.assertTrue(run_id.startswith("sim_run_"),
+                        f"run_id '{run_id}' must start with 'sim_run_'")
+        # Must have timestamp segment and uuid-hex suffix
+        parts = run_id.split("_")
+        self.assertGreaterEqual(len(parts), 3, "run_id must have at least 3 underscore-separated parts")
 
-    def test_verified_count_correct(self):
-        """The embedded REPORT JSON must reflect actual benchmark counts."""
-        import re
-        match = re.search(r'"reagent_verified_count":(\d+)', self.html)
-        self.assertIsNotNone(match, "reagent_verified_count not found in HTML")
-        self.assertEqual(int(match.group(1)), self.report.reagent_verified_count)
+        duration = data.get("execution_duration_ms")
+        self.assertIsNotNone(duration, "execution_duration_ms missing from response")
+        self.assertGreaterEqual(duration, 0, "execution_duration_ms must be >= 0")
 
-    def test_baseline_false_success_correct(self):
-        import re
-        match = re.search(r'"baseline_false_success_count":(\d+)', self.html)
-        self.assertIsNotNone(match)
-        self.assertEqual(int(match.group(1)), self.report.baseline_false_success_count)
+    def test_10_preflight_endpoint_fields(self):
+        """GET /api/model_preflight returns safe boolean fields without secret values."""
+        req = urllib.request.Request(self._url("/api/model_preflight"))
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
 
-    def test_no_external_cdn_dependencies(self):
-        """Dashboard must not load external resources."""
-        for cdn in ("cdn.jsdelivr", "unpkg.com", "cloudflare", "googleapis", "bootstrapcdn"):
-            self.assertNotIn(cdn, self.html, f"External CDN dependency found: {cdn}")
+        # Required fields
+        self.assertIn("api_key_present", data)
+        self.assertIn("model", data)
+        self.assertIn("endpoint", data)
+        self.assertIn("network_calls_allowed", data)
+        self.assertIn("pilot_ledger_exists", data)
 
-    def test_no_api_keys_in_html(self):
-        """HTML export must not contain API key patterns."""
-        import re
-        # Nebius keys start with v1. — ensure nothing matching that pattern is present
-        self.assertNotRegex(self.html, r'\bv1\.[A-Za-z0-9+/=]{20,}')
+        # api_key_present must be bool — never a string containing key material
+        self.assertIsInstance(data["api_key_present"], bool,
+                              "api_key_present must be a bool, not a string")
+        # network_calls_allowed must be False in offline mode
+        self.assertFalse(data["network_calls_allowed"],
+                         "network_calls_allowed must be False in offline mode")
 
-    def test_three_tabs_present(self):
-        self.assertIn('tab-runs', self.html)
-        self.assertIn('tab-benchmark', self.html)
-        self.assertIn('tab-method', self.html)
+    def test_11_preflight_does_not_expose_secret_value(self):
+        """GET /api/model_preflight response body must not contain any API key value."""
+        req = urllib.request.Request(self._url("/api/model_preflight"))
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read().decode("utf-8")
+        # The response must not contain any non-empty NEBIUS_API_KEY value
+        import os
+        api_key_raw = os.environ.get("NEBIUS_API_KEY", "")
+        if api_key_raw and api_key_raw.strip():
+            self.assertNotIn(api_key_raw.strip(), body,
+                             "Secret NEBIUS_API_KEY value must not appear in preflight response")
 
-    def test_run_inspector_sections_present(self):
-        for section_id in ('cvo-container', 'predicate-table-body', 'timeline-list', 'step-inspector', 'receipt-body'):
-            self.assertIn(section_id, self.html, f"Section '{section_id}' missing from HTML")
+    def test_12_template_selector_buttons_in_html(self):
+        """GET / dashboard contains all 3 task template buttons and supported-demo labels."""
+        req = urllib.request.Request(self._url("/"))
+        with urllib.request.urlopen(req) as resp:
+            html_text = resp.read().decode("utf-8")
 
-    def test_method_and_limits_content(self):
-        """Method & Limits tab must include honest limitation disclosures."""
-        self.assertIn("FALSE_SUCCESS", self.html)
-        self.assertIn("ESCALATED", self.html)
-        self.assertIn("illustrative sample size", self.html)
+        self.assertIn("id=\"tpl_wallet_transfer\"", html_text)
+        self.assertIn("id=\"tpl_hotel_booking\"", html_text)
+        self.assertIn("id=\"tpl_database_update\"", html_text)
+        self.assertIn("[Supported Task Template Demo]", html_text)
+        self.assertIn("TASK_TEMPLATES_META", html_text)
 
+    def test_13_hotel_booking_task_template_demo(self):
+        """POST /api/run_recovery_demo?task_template=hotel_booking executes real isolated booking fixture."""
+        req = urllib.request.Request(self._url("/api/run_recovery_demo?task_template=hotel_booking"), method="POST")
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
 
-    def test_html_export_to_file(self):
-        """Test full file write round-trip."""
-        out_dir = tempfile.mkdtemp(prefix="reagent_export_test_")
-        try:
-            out_path = os.path.join(out_dir, "test_export.html")
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(self.html)
-            self.assertTrue(os.path.exists(out_path))
-            with open(out_path, "r", encoding="utf-8") as fh:
-                read_back = fh.read()
-            self.assertEqual(read_back[:100], self.html[:100])
-            self.assertEqual(read_back[-100:], self.html[-100:])
-        finally:
-            shutil.rmtree(out_dir, ignore_errors=True)
+        self.assertEqual(data.get("task_template"), "hotel_booking")
+        self.assertIn("naive_retry_arm", data)
+        self.assertIn("reagent_arm", data)
 
-    def test_scenario_names_in_html(self):
-        for name_fragment in ("Transient", "Invalid Model", "False-Success", "Dependency", "Authentication"):
-            self.assertIn(name_fragment, self.html,
-                          f"Expected scenario fragment '{name_fragment}' not in HTML")
+        naive = data["naive_retry_arm"]
+        reagent = data["reagent_arm"]
 
+        # Entity label reflects flight seat booking
+        ent_desc = reagent.get("details", {}).get("entity_description", "") + data.get("entity_description", "")
+        self.assertIn("FL-2047", ent_desc)
+        self.assertIn("14B", ent_desc)
 
-class TestDataConsistency(unittest.TestCase):
-    """Tests that displayed summary counts match underlying run records."""
+        # ReAgent discovers existing booking via probe, restrains retry
+        self.assertEqual(reagent["tool_attempts"], 1)
+        self.assertEqual(reagent["probe_queries"], 1)
+        self.assertEqual(reagent["ledger_records_count"], 2)
+        self.assertFalse(reagent["duplicate_occurred"])
+        self.assertEqual(reagent["final_status"], "VERIFIED")
+        self.assertTrue(reagent["contract_postconditions_verified"])
 
-    @classmethod
-    def setUpClass(cls):
-        cls.report = run_benchmark_scenarios()
-        cls.data = _normalize_report(cls.report)
+        # Naive attempts blind retry without probe verification
+        self.assertEqual(naive["tool_attempts"], 2)
+        self.assertEqual(naive["probe_queries"], 0)
+        self.assertFalse(naive["contract_postconditions_verified"])
 
-    def test_reagent_verified_from_runs(self):
-        """reagent_verified_count in report must equal count of VERIFIED runs in reagent strategy."""
-        reagent_runs = [r for r in self.data["runs"] if r["strategy"] == "reagent_diagnosis_guided"]
-        computed = sum(1 for r in reagent_runs if r["final_status"] == "VERIFIED")
-        self.assertEqual(computed, self.data["reagent_verified_count"],
-                         f"Computed {computed} != reported {self.data['reagent_verified_count']}")
+    def test_14_database_update_task_template_demo(self):
+        """POST /api/run_recovery_demo?task_template=database_update executes real isolated refund fixture."""
+        req = urllib.request.Request(self._url("/api/run_recovery_demo?task_template=database_update"), method="POST")
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
 
-    def test_reagent_escalated_from_runs(self):
-        reagent_runs = [r for r in self.data["runs"] if r["strategy"] == "reagent_diagnosis_guided"]
-        computed = sum(1 for r in reagent_runs if r["final_status"] == "ESCALATED")
-        self.assertEqual(computed, self.data["reagent_escalated_count"])
+        self.assertEqual(data.get("task_template"), "database_update")
+        self.assertIn("naive_retry_arm", data)
+        self.assertIn("reagent_arm", data)
 
-    def test_baseline_false_success_from_runs(self):
-        baseline_runs = [r for r in self.data["runs"] if r["strategy"] == "naive_fixed_retry"]
-        computed = sum(1 for r in baseline_runs if r["final_status"] == "FALSE_SUCCESS")
-        self.assertEqual(computed, self.data["baseline_false_success_count"])
+        reagent = data["reagent_arm"]
+        naive = data["naive_retry_arm"]
+        ent_desc = reagent.get("details", {}).get("entity_description", "") + data.get("entity_description", "")
+        self.assertIn("ORD-8821", ent_desc)
+        self.assertEqual(reagent["tool_attempts"], 1)
+        self.assertEqual(reagent["probe_queries"], 1)
+        self.assertEqual(reagent["ledger_records_count"], 2)
+        self.assertFalse(reagent["duplicate_occurred"])
+        self.assertEqual(reagent["final_status"], "VERIFIED")
+        self.assertTrue(reagent["contract_postconditions_verified"])
 
-    def test_run_count_is_double_scenarios(self):
-        """Total runs = 2x scenarios (one reagent, one baseline per scenario)."""
-        self.assertEqual(len(self.data["runs"]), self.data["scenarios_evaluated"] * 2)
+        # Naive attempts blind retry without probe verification
+        self.assertEqual(naive["tool_attempts"], 2)
+        self.assertEqual(naive["probe_queries"], 0)
+        self.assertFalse(naive["contract_postconditions_verified"])
 
+    def test_15_task_template_reconciled_benchmark_tab(self):
+        """GET / dashboard contains reconciled benchmark duplicate accounting."""
+        req = urllib.request.Request(self._url("/"))
+        with urllib.request.urlopen(req) as resp:
+            html_text = resp.read().decode("utf-8")
 
-class TestBenchmarkTraceEnrichmentVerifiedAgreement(unittest.TestCase):
-    """
-    Separate class for the claimed-vs-observed agreement test so it can be
-    scoped correctly. Sc4 is VERIFIED via a registry-level fallback after the
-    primary tool failed — so claimed_success can be False on a VERIFIED run.
-    We only assert agreement for runs where the pipeline used execute_with_contract
-    (Sc1, Sc2 are VERIFIED; Sc3 is ESCALATED; Sc5 is ESCALATED).
-    """
+        self.assertIn("Duplicate Writes (Primary / Audit)", html_text)
+        self.assertIn("24 unsafe retries produced 4 duplicate primary records and 5 duplicate audit log rows", html_text)
 
-    @classmethod
-    def setUpClass(cls):
-        cls.report = run_benchmark_scenarios()
-        cls.reagent_runs = [r for r in cls.report.runs if r.strategy == "reagent_diagnosis_guided"]
+    def test_16_model_contract_proposal_integration(self):
+        """POST /api/run_recovery_demo?use_model_contract=1 reflects model contract proposal in provenance and event log."""
+        req = urllib.request.Request(self._url("/api/run_recovery_demo?scenario=B&use_model_contract=1"), method="POST")
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
 
-    def test_pipeline_verified_runs_have_matching_claimed_and_observed(self):
-        """
-        For runs that used execute_with_contract and are VERIFIED:
-        tool_reported_success should be True and verifier_verdict should be PASS.
-        Scenario 4 uses a registry fallback (not execute_with_contract) so is excluded.
-        """
-        pipeline_verified = [
-            r for r in self.reagent_runs
-            if r.final_status == "VERIFIED"
-            and r.scenario_id != "SCENARIO_4_ENVIRONMENT_DEPENDENCY_FAILURE"
-        ]
-        for r in pipeline_verified:
-            self.assertTrue(
-                r.claimed_outcome["tool_reported_success"],
-                f"Pipeline-verified run {r.scenario_id} has claimed_success=False"
-            )
-            self.assertEqual(
-                r.observed_outcome["verifier_verdict"], "PASS",
-                f"Pipeline-verified run {r.scenario_id} verifier_verdict != PASS"
-            )
+        self.assertEqual(data.get("provenance"), "MODEL_PROPOSAL_VERIFIED")
+        reagent = data["reagent_arm"]
+        self.assertEqual(reagent.get("provenance"), "MODEL_PROPOSAL_VERIFIED")
+        self.assertEqual(reagent.get("details", {}).get("contract_source"), "NVIDIA_NEMOTRON_ADVISORY")
 
-    def test_sc4_fallback_verified_but_primary_failed(self):
-        """
-        Scenario 4 is VERIFIED via fallback after primary tool was unregistered.
-        The claimed_outcome reflects the primary tool's failure (False),
-        while the run is still marked VERIFIED.
-        """
-        sc4 = next((r for r in self.reagent_runs
-                    if r.scenario_id == "SCENARIO_4_ENVIRONMENT_DEPENDENCY_FAILURE"), None)
-        self.assertIsNotNone(sc4)
-        self.assertEqual(sc4.final_status, "VERIFIED")
-        # Primary tool claimed failure (it was unregistered)
-        self.assertFalse(sc4.claimed_outcome["tool_reported_success"])
-        # Observed outcome reflects the successful fallback
-        self.assertEqual(sc4.observed_outcome["verifier_verdict"], "PASS")
+        # Verify event log reflects the model proposal source
+        ev_req = urllib.request.Request(self._url(f"/api/event_log?scenario=B&run_id={data.get('run_id')}"))
+        with urllib.request.urlopen(ev_req) as ev_resp:
+            self.assertEqual(ev_resp.status, 200)
+            ev_data = json.loads(ev_resp.read().decode("utf-8"))
+            events = ev_data.get("events", [])
+            freeze_events = [e for e in events if e.get("action") == "FREEZE_CONTRACT"]
+            self.assertTrue(len(freeze_events) > 0)
+            self.assertIn("from NVIDIA Nemotron proposal", freeze_events[0].get("detail", ""))
 
 
 if __name__ == "__main__":

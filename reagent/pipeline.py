@@ -677,6 +677,24 @@ class ReAgentPipeline:
                     )
                     return dummy, esc_ev, esc_v, 0, AgentStatus.ESCALATED
 
+            # Invariant 1 & 2: UNKNOWN is not ABSENT. DISCREPANCY/UNKNOWN/UNAVAILABLE/UNOBSERVABLE states must NEVER trigger retry.
+            if probe_status in ("DISCREPANCY", "UNKNOWN", "UNAVAILABLE", "UNOBSERVABLE"):
+                reason = (
+                    f"AmbiguousOrDiscrepantStateProhibitsRetry: {tool_name} probe returned '{probe_status}'; "
+                    f"UNKNOWN is not ABSENT and partial/corrupted state cannot be blindly retried. Fail-closed escalation."
+                )
+                timeline.emit("SAFETY_GATE_BLOCKED_RETRY", {"reason": reason})
+                self.agent_state.status = AgentStatus.ESCALATED
+                self.reliability_state.escalations += 1
+                dummy = ActionResult(tool_name=tool_name, success=False, error=reason)
+                esc_ev = self.evidence_collector.collect_from_action(dummy)
+                esc_v = self.verifier.verify(
+                    recovery_decision_id=f"step-{self.agent_state.step_index}-safety-gate",
+                    evidence=esc_ev,
+                    assertions=assertion_rules,
+                )
+                return dummy, esc_ev, esc_v, 0, AgentStatus.ESCALATED
+
             # Safety gate for retry on non-idempotent operations:
             tool_obj = self.tool_registry.get_tool(tool_name)
             is_idempotent = supports_idempotency if supports_idempotency is not None else getattr(tool_obj, "supports_idempotency_key", False)

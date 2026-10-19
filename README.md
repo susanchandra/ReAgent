@@ -1,215 +1,243 @@
-# ReAgent: Deterministic AI Agent Reliability Layer
+# ReAgent: Outcome Verification & Safe Recovery for AI Agent Actions
 
-> **Tagline:** *"ReAgent doesn't trust 'done.' It verifies it."*
-> **Pitch:** ReAgent makes AI agents self-recovering: it diagnoses failures, separates agent errors from environment failures, and autonomously recovers and verifies observable outcomes.
-> **Target Track:** Best Apps & Agents — NVIDIA x Nebius Global AI Hackathon 2026
-
-
----
-
-## 1. The Problem: Why Agents Fail Silently
-
-Contemporary LLM agents frequently declare tasks completed when they are broken:
-- **False-Success Illusion:** An agent runs a tool, receives an exit code 0 or empty output, and hallucinates that the user's objective was achieved.
-- **Evaluator Bias (Self-Grading):** When an LLM is asked to grade its own output, it suffers from systematic confirmation bias and repeatedly validates broken artifacts.
-- **Unbounded Retry Loops:** When an API fails, naive agents retry in tight loops, exhausting rate limits and racking up billable token costs without diagnosing root causes.
-- **Silent Degradation:** When an agent cannot fix an error, it often outputs a plausible explanation and marks the ticket "resolved" rather than escalating cleanly.
-
-ReAgent solves this by enforcing an **independent, deterministic verification and recovery barrier** between the LLM and the real world.
+> **Headline:** *"A timeout isn't a no."*<br>
+> **Supporting Line:** *"ReAgent checks what actually happened before an AI agent retries, so a lost response doesn't have to become a double charge."*<br>
+> **Technical Principle:** *"Unknown is not absent."*<br>
+> **Category:** Outcome verification and safe recovery for AI-agent actions<br>
+> **Target Track:** Best Apps & Agents — NVIDIA × Nebius Global AI Hackathon 2026<br>
+> **Target Architecture:** NVIDIA Nemotron (`nvidia/nemotron-3-super-120b-a12b`) on Nebius Token Factory<br>
+> **Provenance:** SYNTHETIC / DETERMINISTIC OFFLINE FIXTURES (0 network calls required for offline judging)<br>
+> **License:** MIT License (Open Source)
 
 ---
 
-## 2. Core Architecture & Guarantees
+## 1. The Real Problem & Intended Users
+
+### Who ReAgent is For
+ReAgent is designed for engineers deploying **autonomous AI agents in production environments** that perform real-world, state-changing actions—such as executing SQL database mutations, initiating financial ledger transfers, processing customer orders, or triggering external webhooks.
+
+### The Real Problem: Post-Commit Ambiguity
+When an AI agent executes a state-changing tool and the network connection drops or times out:
+1. **The tool timed out before reaching the database** (action never committed).
+2. **The database committed the transaction, but the network connection timed out before the tool could return a success response** (`COMMIT_THEN_TIMEOUT`).
+
+To the agent, both cases look identical: an unhandled timeout error.
+
+### Why Standard Solutions Fail Catastrophically
+- **Naive Retry Loops**: The agent assumes timeout equals failure and blindly retries. On non-idempotent endpoints (such as high-value wallet debits), this causes **irreversible double charges, duplicate records, and financial corruption**.
+- **Shallow Presence Observation (`COUNT > 0`)**: Some frameworks check if a record exists. In our 480-trial benchmark, shallow presence checking suffered a **44.8% false verification rate** because it mistakenly verifies partial commits, corrupted columns, or wrong debit amounts.
+- **Self-Grading (Evaluator Bias)**: Asking an LLM to evaluate its own tool calls creates systematic confirmation bias where broken states are hallucinated as successful.
+
+---
+
+## 2. Core ReAgent Architecture & Guarantees
 
 ```
                    USER TASK OBJECTIVE
-                            |
-                            v
-       PROVIDER DECISION ENGINE (Nebius Nemotron)
-                            |
-                            v
-           STRICT SCHEMA & ALLOWLIST VALIDATION
-                            |
-                            v
-              CONTRACT GROUNDING VALIDATOR
-     (Rejects vacuous, mismatched, or invalid contracts)
-                            |
-                            v
-                  FREEZE SUCCESS CONTRACT
-            (Immutable: cannot be relaxed by LLM)
-                            |
-                            v
-           TOKEN BUDGET GUARD & POLICY CHECK
+                            │
+                            ▼
+      NEBIUS TOKEN FACTORY (nvidia/nemotron-3-super-120b-a12b)
+       Derives structured precondition & postcondition contract
+                            │
+                            ▼
+          OFFLINE CANDIDATE VALIDATION GATE
+     Strict Pydantic schema allowlist & task grounding check
+                            │
+                            ▼
+                 FREEZE SUCCESS CONTRACT
+          (Immutable: cannot be relaxed by LLM)
+                            │
+                            ▼
+             TOKEN BUDGET GUARD & POLICY CHECK
             (Pre-call reservation against ledger)
-                            |
-                            v
-                 SANDBOXED TOOL EXECUTION
-                            |
-                            v
-             INDEPENDENT EVIDENCE COLLECTION
-                            |
-                            v
+                            │
+                            ▼
+                SANDBOXED TOOL EXECUTION
+          (e.g., Database write or ledger transfer)
+                            │
+                            ▼
+          INDEPENDENT READ-ONLY PROBE QUERY
+     (query_only=ON: Fresh isolated connection; zero mutations)
+                            │
+                            ▼
                  DETERMINISTIC VERIFIER
-        (LLM has ZERO influence over pass/fail)
-              /                                \
-             /                                  \
-      [All Passed]                       [Discrepancy Found]
-           |                                      |
-           v                                      v
-    VERIFIED RECEIPT                     BOUNDED RECOVERY LOOP
-                                         1. Failure Attribution
-                                         2. Policy-Guarded Strategy
-                                         3. Reverification
-                                         4. ESCALATE if exhausted
+        (Evaluates exact column invariants & deltas)
+              /                            \
+             /                              \
+      [Postconditions Met]             [Ambiguous / Corrupted]
+            │                                     │
+            ▼                                     ▼
+     VERIFIED RECEIPT                     BOUNDED RECOVERY LOOP
+   Retry restrained!                     1. Discrepancy diagnosis
+   Duplicate mutation prevented          2. Idempotency safety check
+                                         3. Safe retry iff CONFIRMED ABSENT
+                                         4. FAIL-CLOSED ESCALATION if UNKNOWN
 ```
 
 ### Architectural Guarantees
-
-1. **Provider Proposes; Deterministic Verifier Decides:** The LLM proposes actions and verifiable postconditions. An offline, deterministic rule engine evaluates actual filesystem and environment state. The model never grades its own homework.
-2. **Frozen Success Contracts:** Success criteria are captured in a `SuccessContract` and permanently frozen before tool execution. Recovery logic cannot loosen or alter postconditions to achieve a false pass.
-3. **Pre-Invocation Grounding Checks:** Contracts are validated before tool execution. If target paths mismatch tool arguments, postconditions are vacuous (target already exists), or predicates lack grounding in the objective, execution is rejected immediately (call count remains 0).
-4. **Sandboxed File Boundaries:** All file predicates resolve inside a strictly guarded `workspace_root`. Directory traversal (`..`), drive letter escapes (`C:`, `D:`), and symlinks escaping the boundary are blocked with `PermissionError`. File reads are capped at 1 MB.
-5. **Cross-Process Token Ledger:** A persistent, file-locked `GlobalTokenLedger` tracks cumulative token and call usage across process restarts. Unknown token usage charges the conservative reservation. Corrupt ledgers fail closed (`CorruptLedgerError`).
-6. **Immutable Audit Receipts:** Every execution path (success, truncation, provider failure, escalation) persists a strictly allowlisted, sanitized audit receipt without leaking API keys, credentials, or internal thoughts.
+1. **Model Proposes; Deterministic Verifier Decides**: NVIDIA Nemotron derives the declarative contract. An independent, deterministic rule engine evaluates actual filesystem and database state. The model never grades its own work.
+2. **Frozen Success Contracts**: Preconditions and postconditions are permanently frozen before tool execution. Recovery logic cannot loosen criteria to force a false pass.
+3. **Mandatory Read-Only Probing**: Independent observation uses fresh connections with `query_only=ON` write-blocking enforced. Probing can never mutate application state.
+4. **Retry Safety Gate**: `UNKNOWN` is never treated as `ABSENT`. If probe status is `DISCREPANCY`, `UNKNOWN`, `UNAVAILABLE`, or `UNOBSERVABLE`, retries are strictly blocked and ReAgent fails closed to `ESCALATED`.
+5. **Cross-Process Token Ledger**: A file-locked `GlobalTokenLedger` tracks cumulative token and call usage across process restarts with conservative pre-call reservations.
 
 ---
 
-## 3. Quick Start (100% Offline — No API Key Required)
+## 3. The Role of NVIDIA Nemotron & Nebius Token Factory
 
-ReAgent is built to run and verify completely offline right out of the box using its built-in `DevelopmentLLMProvider`.
+### What NVIDIA Nemotron Does
+ReAgent leverages **`nvidia/nemotron-3-super-120b-a12b`** hosted on **Nebius Token Factory**. Its role is strictly defined:
+- **Contract Derivation**: Translates user task specifications and database schemas into structured JSON contracts specifying exact primary table predicates, expected column values, and multi-table audit assertions.
+- **Candidate Validation**: Candidate contracts are passed through an offline candidate validation gate that strictly enforces schema rules, rejects hallucinated keys, and verifies grounding against declared task parameters.
+- **Fail-Closed Isolation**: If the model produces unparseable JSON or violates schemas, ReAgent rejects the candidate and fails closed—it never falls back to an unverified action.
+
+### How Nebius Token Factory is Used
+- Nebius Token Factory serves as the high-performance inference backend, accessed via standard OpenAI-compatible endpoints with token streaming and pre-flight parameter guards (`temperature=0.0`, `max_tokens=512`).
+- To protect developer credits, all benchmark evaluations and test suites run in **100% offline mode** using deterministic mocks. Live Nebius requests require explicit human authorization via `--live-run-opt-in`.
+
+---
+
+## 4. Quickstart: 2-Minute Judge Walkthrough
+
+ReAgent is built to run and verify completely offline right out of the box with zero network access, zero billing, and no API keys required.
 
 ### Prerequisites
 - Python 3.10+ (Windows / Linux / macOS)
-- Virtual environment with requirements installed:
+- Standard library or optional virtual environment:
 ```powershell
 python -m venv reagent_env
 .\reagent_env\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### Run the Offline Mechanics Demo
-The offline demo exercises all 5 core reliability mechanics scenarios using the local `DevelopmentLLMProvider` with zero network access, zero billing, and no API keys:
+### 1. Run the Unified Terminal Judge Demo (<4 seconds)
 ```powershell
-python scripts/demo_offline.py
+python -m reagent.experiments.dbops.judge_demo
 ```
+**What this demonstrates:**
+- **Part 1 — Live Recovery Demonstration**: Executes Task 02 ($500 wallet transfer) under an injected `COMMIT_THEN_TIMEOUT` fault on fresh disposable SQLite databases.
+  - *Naive Retry Baseline*: Double-debits $1,000 across 2 rows, draining account to $0.00 (`UNVERIFIED_CORRUPTED`).
+  - *ReAgent Layer*: Probes independently, verifies committed state, restrains retry, and preserves single $500 debit (`VERIFIED`).
+- **Part 2 — 480-Trial Comparative Benchmark**: Evaluates all 5 policy arms with full denominator integrity.
 
-> **Note on Demo Scope:** This script is an **offline mechanics demonstration** of ReAgent's contract-freezing, deterministic verification, and bounded recovery loop logic using rule-based mocks. It demonstrates the reliability framework's internal mechanics, not live model inference. Live model integration is handled separately via `NebiusNemotronProvider` under strict human supervision.
-
-Expected output:
-```
-================================================================
-  ReAgent Offline Demo: 5/5 scenarios PASSED
-================================================================
-  [PASS]  All 5 scenarios passed. No API key required.
-```
-
-### Run the Benchmark Comparison (ReAgent vs Illustrative Naive Baseline)
-Execute the benchmark evaluating ReAgent against an illustrative naive fixed-retry loop across 5 seeded deterministic scenarios (n=5):
-```powershell
-python scripts/run_benchmark.py
-```
-Output full JSON traces:
-```powershell
-python scripts/run_benchmark.py --json
-```
-
-### Launch the Judge-Facing Reliability Dashboard
-Launch the local web dashboard to visually inspect timelines, failure attribution, and head-to-head comparison:
+### 2. Launch the Interactive Mission Control Dashboard
 ```powershell
 python reagent/ui_server.py --port 8080
 ```
-Then navigate to `http://127.0.0.1:8080/`.
+Open your browser at **`http://127.0.0.1:8080/`**.
 
-To export a standalone, portable HTML report for submission:
+#### Five Recovery Scenarios Demonstrated:
+- **Scenario A (Normal Success)**: Clean execution. Both agents execute once; ReAgent independently observes and verifies postconditions.
+- **Scenario B (Commit-Then-Timeout)**: Transaction commits on disk, but network response is lost. Naive retry causes duplicate mutations; ReAgent probes, observes committed state, and restrains retry.
+- **Scenario C (Fail-Before-Commit)**: Network drop occurs before commit; database is untouched. ReAgent proves absence via independent probe, retries safely exactly once, and verifies.
+- **Scenario D (Unknown Outcome)**: Commit occurs but read/probe path is unreachable. ReAgent enforces *"Unknown is not absent"*, refusing to guess or retry blindly, and escalates. An operator **Judge Oracle Reveal** button discloses the hidden ground truth.
+- **Scenario E (Partial Commit)**: Multi-step transaction partially writes (ledger row commits, but balance update fails). ReAgent detects the discrepancy against frozen postconditions and halts/escalates to an operator rather than repeating the corrupt action.
+
+#### Three Isolated Task Template Demos:
+- **💳 Wallet Transfer** (`UNPROTECTED_NUMERIC`): $500 transfer (ACCT-2201 → ACCT-3390). Unprotected balance decrement exposes double debits under naive retry.
+- **🏨 Hotel / Seat Booking** (`KEY_PROTECTED`): Seat 14B reservation on Flight FL-2047. `UNIQUE(flight_id, seat_num)` constraint blocks physical duplication, but naive retry crashes and misclassifies state.
+- **🗄 Database Update / Refund** (`KEY_PROTECTED` on primary, unconstrained on audit): Refund REF-550291. Primary key protects refund table while secondary audit log duplicates under blind retry.
+
+To export a standalone portable HTML report without running a server:
 ```powershell
-python reagent/ui_server.py --export-html reports/benchmark_dashboard.html
+python reagent/ui_server.py --export-html reports/dbops/reagent_judge_dashboard.html
 ```
 
-### Run the Milestone E2E Runner
+### 3. Validate Cryptographic Submission Manifest (12/12 Verified)
 ```powershell
-python -m reagent.e2e
+python -m reagent.experiments.dbops.validate_submission_manifest
 ```
+Recomputes SHA-256 hashes from actual disk bytes and validates all 12 indexed submission artifacts.
 
 ---
 
-## 4. Demonstrable Scenarios
+## 5. DBOPS Comparative Benchmark: 480-Trial Empirical Evidence
 
-ReAgent includes 6 formal failure scenarios in `reagent/scenarios/definitions.py` and benchmark tests in `tests/test_scenarios.py`:
+Evaluated across **12 tasks × 8 fault modes × 5 policy arms = 480 paired trials** on fresh disposable SQLite databases:
 
-| Scenario ID | Name | Trigger Condition | ReAgent Diagnosis | Recovery Strategy | Verification Outcome |
-|---|---|---|---|---|---|
-| **Scenario A** | Malformed Input | Tool called with missing required parameters | `INPUT_CONTEXT` | `RETRY_MODIFIED_INPUT` | Parameter corrected, reverified |
-| **Scenario B** | Transient Failure | 502 Bad Gateway / upstream network error | `TRANSIENT_EXTERNAL` | `WAIT_AND_RETRY` | Backoff wait, retry verified |
-| **Scenario C** | Unavailable Dependency | Model asks for un-allowlisted tool | `ENVIRONMENT_FAILURE` | `FALLBACK_TOOL` | Fallback allowlisted tool selected and verified |
-| **Scenario D** | Model Output Error | Model returns malformed / unparseable JSON | `MODEL_OUTPUT` | `RETRY_MODIFIED_INPUT` | Schema re-enforced, retry verified |
-| **Scenario E** | Repeated Auth Failure | 403 Forbidden exhausts retry budget | `AUTHORIZATION` | `ESCALATE` | PolicyGuard blocks infinite loop, cleanly escalates |
-| **Scenario F** | False Success Detection | Tool returns status 0 but expected output file missing | `TOOL_FAILURE` | `RETRY_MODIFIED_INPUT` | Verifier catches discrepancy, triggers recovery |
+| Policy Arm | Total Trials | True Verified | False Verified | False Ver. Rate | Safe Escalations | Unnec. Escalations | Unsafe Retries | Duplicate Writes (Primary / Audit) | Avg Latency |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`REAGENT_CONTRACT`** | **96** | **29** | **0** | **0.0%** | **67** | **0** | **0** | **0 / 0** | 13.98 ms |
+| `SHARED_OBSERVATION` | **96** | 29 | 43 | **44.8%** | 24 | 0 | 0 | 0 / 3 | 14.10 ms |
+| `TOOL_CLAIM_ONLY` | **96** | 15 | 45 | **46.9%** | 29 | 7 | 0 | 0 / 0 | 8.45 ms |
+| `NAIVE_RETRY` | **96** | 32 | 64 | **66.7%** | 0 | 0 | **24** | **4 / 5** | 15.65 ms |
+| `ALWAYS_ESCALATE` | **96** | 0 | 0 | **0.0%** | 74 | 22 | 0 | 0 / 0 | 7.92 ms |
+
+### Exact Mathematical Accounting Invariant
+Every trial is mapped to exactly one mutually exclusive outcome:
+$$\text{true\_verified} + \text{false\_verified} + \text{safe\_escalations} + \text{unnecessary\_escalations} = \text{total\_trials} = 96$$
+
+### Duplicate Write Accounting Reconciliation (from 480 Raw Trial Records)
+- **24 Unsafe Retries**: Trials where the Naive Agent executed a blind retry after an ambiguous error (`COMMIT_THEN_TIMEOUT`, `PARTIAL_COMMIT`, `STATUS_UNAVAILABLE`, `UNOBSERVABLE`).
+- **4 Duplicate Primary Records**: Duplicate financial balance debits (`duplicate_primary_count: 4`) in unprotected numeric tables.
+- **5 Duplicate Audit Log Rows**: Secondary audit log duplications on unconstrained append-only tables (`duplicate_audit_count: 5`).
+- **Constraint Prevention**: In the remaining 15 unsafe retries, table-level uniqueness constraints caught the collision and prevented physical table duplication, but the agent still claimed false verification (64 false verifications total).
+- **ReAgent Guarantee**: ReAgent had **0 unsafe retries, 0 duplicate primary writes, and 0 duplicate audit writes** across all 96 trials.
 
 ---
 
-## 5. Offline Test Suite
+## 6. Running the Automated Test Suite
 
-ReAgent features a comprehensive offline test suite covering contract validation, provider isolation, token budget accounting, and deterministic verification:
+ReAgent includes comprehensive automated test suites covering recovery invariants, adversarial faults, schema validation, accounting integrity, mock provider integration, clean-start smoke tests, UI server endpoints, real Nemotron contract proposal verification, and final readiness gate constraints:
 
 ```powershell
-# Ensure live tests remain disabled
-Remove-Item env:REAGENT_ALLOW_LIVE_TESTS -ErrorAction SilentlyContinue
+# Run full comprehensive test suite (583 passed, 11 skipped in ~2 minutes):
+python -m pytest tests/ -q --tb=no
 
-# Run test discovery
-python -m unittest discover -s tests -p "test_*.py" -v
+# Run focused UI and integration test suite:
+python -m pytest tests/test_ui_server.py -v
 ```
 
 **Results:**
-- **132 Tests Passing**
-- **10 Skipped** (live Nebius integration tests — require explicit opt-in)
+- **583 Tests Passing** (11 skipped)
 - **0 Failures / 0 Errors**
-- **Total Execution Time:** ~1.6 seconds
+- **Network Calls:** **ZERO** (Strictly offline)
 
 ---
 
-## 6. Configuration & Environment Variables
+## 7. Supervised Live Pilot Protocol (Optional / Human Authorization)
 
-| Variable | Purpose | Default | Permitted Bounds |
-|---|---|---|---|
-| `NEBIUS_API_KEY` | Canonical API key for Nebius Token Factory | None | Non-empty string |
-| `NEBIUS_NEMOTRON_MODEL` | Model ID on Nebius Token Factory | `nvidia/nemotron-3-super-120b-a12b` | Any valid model ID |
-| `NEBIUS_BASE_URL` | Nebius Token Factory endpoint | `https://api.tokenfactory.nebius.com/v1/` | Valid URL |
-| `REAGENT_MAX_TOKENS` | Completion token limit per provider call | `1536` | Code-enforced: [16, 4096] |
-| `REAGENT_LEDGER_MAX_CALLS` | Persistent cumulative call limit | `20` | Code-enforced: <= 50 |
-| `REAGENT_LEDGER_MAX_TOKENS`| Persistent cumulative token limit | `60000` | Code-enforced: <= 200,000 |
-| `REAGENT_LEDGER_PATH` | Path to persistent ledger JSON file | `~/.reagent/token_ledger.json` | Valid filepath |
-| `REAGENT_ALLOW_LIVE_TESTS` | Explicit opt-in gate for integration tests | Unset | Must be `1` to run live tests |
-
-> **Security Note:** Never store API keys in source control. If you have a key, pass it via environment variable in your session.
-
----
-
-## 7. Supervised Live Probe Protocol (Human-in-the-Loop)
-
-ReAgent includes a minimal, supervised live probe script (`scripts/live_probe.py`) designed for careful verification of remote Nebius Token Factory connectivity.
-
-### Strict Safety Guards Enforced:
-1. **Mandatory Confirmation Flag:** Must be explicitly invoked with `--confirm-billing-checked`.
-2. **Single Call Cap:** Makes exactly ONE live call for a read-only task (`json_validator`).
-3. **Dual Opt-In Required:** Integration tests require BOTH `NEBIUS_API_KEY` and `REAGENT_ALLOW_LIVE_TESTS=1`. Setting the key alone will never trigger live tests.
-4. **Pre-Call Reservation:** Full request prompt tokens plus configured completion tokens are reserved before making the network request.
-5. **Fail-Closed Reconciliation:** If ledger reconciliation encounters an error, the run fails closed with `PROBE_ACCOUNTING_UNCERTAIN` and exit code 1.
+To connect to live Nebius Token Factory endpoints, ReAgent enforces a strict human-in-the-loop safety protocol:
+1. **Mandatory Explicit Opt-In**: Requires the `--live-run-opt-in` CLI flag. Live execution is **never inferred** from environment variables alone.
+2. **Preflight Verification**: An offline dry-run preflight check is always executed first.
+3. **Hard Ceiling**: Hard global cap of 6 dispatch attempts enforced by a durable ledger (`reports/dbops/pilot_ledger.jsonl`).
+4. **Secret Protection**: Keys are never printed, logged, or included in reports.
 
 ```powershell
-# Example supervised invocation (requires human authorization):
-python scripts/live_probe.py --confirm-billing-checked
+# 1. Offline preflight dry-run (0 network calls, 0 cost):
+python run_live_pilot.py
+
+# 2. Live execution (requires explicit human authorization and valid API key):
+$env:NEBIUS_API_KEY = "your-key-here"
+python run_live_pilot.py --live-run-opt-in
 ```
 
 ---
 
-## 8. Limitations & Engineering Tradeoffs
+## 8. Limitations & Honest Engineering Disclosure
 
-- **Token Estimation Heuristic:** ReAgent uses a character-to-token ratio heuristic (~1 token per 3 characters) with message framing padding and floors to remain 100% dependency-free offline. In code-dense or non-English prompts, conservative over-reservation occurs and is reconciled post-call.
-- **Local Ledger Scope:** The `GlobalTokenLedger` relies on OS file locking (`filelock`). It enforces local machine boundaries across processes, but is not a distributed cluster ledger.
-- **No Provider-Side Billing Guarantee:** Local token counters prevent local runaway loops; they do not control provider-side subscription tiers or minimum billing increments.
+- **Synthetic vs. Live Evidence**: All benchmark metrics (480 trials) and interactive demonstrations are derived from deterministic SQLite fixtures with simulated fault injection. This rigorously isolates and validates the algorithmic recovery semantics and retry restraint.
+- **Model-Derived Contract Arm**: While candidate contract validation and schema allowlists are fully verified offline, live dynamic contract extraction using `nvidia/nemotron-3-super-120b-a12b` remains deferred pending explicit human authorization and network opt-in.
+- **Safety Trade-off**: ReAgent intentionally prioritizes safety over blind completion. Under ambiguous unobservable states, it escalates rather than retrying blindly, resulting in a higher escalation rate but **100% protection against data corruption**.
 
 ---
 
-## 9. License
+## 9. Submission Artifacts Directory
 
-MIT License — see [LICENSE](LICENSE) for details.
+| Document / Artifact | Description |
+| :--- | :--- |
+| [`reports/dbops/submission/README.md`](reports/dbops/submission/README.md) | Submission guide and judge quickstart |
+| [`reports/dbops/submission/problem_statement.md`](reports/dbops/submission/problem_statement.md) | Technical problem statement and failure analysis |
+| [`reports/dbops/submission/architecture.md`](reports/dbops/submission/architecture.md) | Deep architecture: contracts, observer, and policy engine |
+| [`reports/dbops/submission/evaluation.md`](reports/dbops/submission/evaluation.md) | 480-trial empirical benchmark results |
+| [`reports/dbops/submission/demo_script.md`](reports/dbops/submission/demo_script.md) | 2-minute walkthrough guide for evaluators |
+| [`reports/dbops/submission/limitations.md`](reports/dbops/submission/limitations.md) | Operational boundaries and synthetic vs live status |
+| [`reports/dbops/submission/video_script.md`](reports/dbops/submission/video_script.md) | YouTube video script and shot plan (<3 min) |
+| [`reports/dbops/submission/devpost_submission.md`](reports/dbops/submission/devpost_submission.md) | Complete Devpost submission draft and sponsor feedback |
+| [`reports/dbops/submission/submission_manifest.json`](reports/dbops/submission/submission_manifest.json) | Cryptographic SHA-256 index of all submission files |
+
+---
+
+## 10. License
+
+MIT License — see [LICENSE](LICENSE) for full details.

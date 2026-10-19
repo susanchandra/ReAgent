@@ -44,10 +44,13 @@ htmlcov/
 # Temp / scratch
 *.tmp
 *.bak
+hlib
 
 # Ledger files, locks, and atomic temp files (runtime state, NOT source controlled)
 ~/.reagent/
 *.ledger.json
+*ledger*.json
+*ledger*.jsonl
 *.lock
 *.tmp.*
 

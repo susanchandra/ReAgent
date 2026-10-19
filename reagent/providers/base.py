@@ -5,12 +5,14 @@ Defines the abstract interface for intelligence providers (Nemotron, Development
 
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from reagent.models import FailureEvent, FailureDiagnosis, RecoveryDecision, StructuredDecision
 
 
 class LLMResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     content: str
     parsed_json: Optional[Dict[str, Any]] = None
     model_name: str

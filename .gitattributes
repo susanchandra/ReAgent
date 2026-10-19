@@ -1,0 +1,4 @@
+# Enforce LF line endings for cryptographic manifest files across all platforms
+reagent/experiments/dbops/*.py text eol=lf
+reports/dbops/submission/* text eol=lf
+reports/dbops/*.json text eol=lf

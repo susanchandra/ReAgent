@@ -11,7 +11,18 @@ import time
 import logging
 from typing import Dict, Any, Optional, List
 
-from openai import OpenAI, APIError
+from openai import (
+    OpenAI,
+    APIError,
+    AuthenticationError,
+    PermissionDeniedError,
+    NotFoundError,
+    RateLimitError,
+    APITimeoutError,
+    APIConnectionError,
+    BadRequestError,
+    InternalServerError,
+)
 
 from reagent.providers.base import LLMProvider, LLMResponse
 from reagent.models import (
@@ -21,6 +32,25 @@ from reagent.models import (
 from reagent.taxonomy import FailureType, RecoveryStrategyType
 
 logger = logging.getLogger(__name__)
+
+
+class SanitizedProviderError(RuntimeError):
+    """
+    Sanitized provider exception.
+    Contains category, sanitized description, and optional HTTP status code.
+    Guaranteed NEVER to leak secrets, API keys, or raw authorization headers.
+    """
+    def __init__(self, category: str, status_code: Optional[int] = None, details: Optional[str] = None):
+        self.category = category
+        self.status_code = status_code
+        self.details = details or ""
+        msg = f"{category}"
+        if status_code:
+            msg += f" (HTTP {status_code})"
+        if details:
+            msg += f": {details}"
+        super().__init__(msg)
+
 
 # Default verified model (confirmed live on Nebius Token Factory).
 # Override via NEBIUS_NEMOTRON_MODEL env var.
@@ -140,9 +170,13 @@ class NebiusNemotronProvider(LLMProvider):
         model: Optional[str] = None,
         base_url: Optional[str] = None,
         client: Optional[Any] = None,
+        timeout: float = 30.0,
+        max_retries: int = 0,
     ):
         self.model = model or os.environ.get("NEBIUS_NEMOTRON_MODEL", DEFAULT_MODEL)
         self._base_url = base_url or os.environ.get("NEBIUS_BASE_URL", DEFAULT_BASE_URL)
+        self.timeout = timeout
+        self.max_retries = max_retries
 
         self.last_usage: Optional[Dict[str, int]] = None
         self.last_finish_reason: Optional[str] = None
@@ -160,12 +194,18 @@ class NebiusNemotronProvider(LLMProvider):
                 self._client = OpenAI(
                     api_key=api_key,
                     base_url=self._base_url,
+                    timeout=self.timeout,
+                    max_retries=self.max_retries,
                 )
             else:
                 self._client = None
 
     def is_configured(self) -> bool:
         return self._is_configured
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
 
     def get_last_usage(self) -> Optional[Dict[str, int]]:
         """Return non-sensitive prompt/completion/total token counts from last call."""
@@ -301,8 +341,64 @@ class NebiusNemotronProvider(LLMProvider):
         t0 = time.perf_counter()
         try:
             response = self._client.chat.completions.create(**kwargs)  # type: ignore[union-attr]
+        except AuthenticationError:
+            raise SanitizedProviderError(
+                category="AUTH_REJECTED",
+                status_code=401,
+                details="API key invalid, expired, or unauthorized for this endpoint/service",
+            ) from None
+        except PermissionDeniedError:
+            raise SanitizedProviderError(
+                category="AUTH_REJECTED",
+                status_code=403,
+                details="Permission denied for this model or account",
+            ) from None
+        except NotFoundError:
+            raise SanitizedProviderError(
+                category="MODEL_NOT_FOUND",
+                status_code=404,
+                details=f"Model '{self.model}' not found or unavailable on endpoint '{self.base_url}'",
+            ) from None
+        except RateLimitError:
+            raise SanitizedProviderError(
+                category="RATE_LIMIT",
+                status_code=429,
+                details="Quota exceeded or rate limit hit on Nebius Token Factory",
+            ) from None
+        except APITimeoutError:
+            raise SanitizedProviderError(
+                category="TIMEOUT",
+                status_code=408,
+                details=f"Request timed out after configured timeout ({getattr(self, '_timeout', 30.0)}s)",
+            ) from None
+        except APIConnectionError:
+            raise SanitizedProviderError(
+                category="NETWORK_ERROR",
+                status_code=None,
+                details="Failed to connect to endpoint (DNS resolution, TLS, or connection refused)",
+            ) from None
+        except BadRequestError as exc:
+            status = getattr(exc, "status_code", 400)
+            raise SanitizedProviderError(
+                category="BAD_REQUEST",
+                status_code=status,
+                details="Server rejected request parameters (e.g. invalid parameter or unsupported json_object mode)",
+            ) from None
+        except InternalServerError as exc:
+            status = getattr(exc, "status_code", 500)
+            raise SanitizedProviderError(
+                category="SERVER_ERROR_5XX",
+                status_code=status,
+                details="Nebius upstream server error",
+            ) from None
         except APIError as exc:
-            raise RuntimeError(f"Nebius API error: {exc.message}") from exc
+            status = getattr(exc, "status_code", None)
+            cat = f"SERVER_ERROR_{status}" if status and status >= 500 else f"API_ERROR_{status or 'UNKNOWN'}"
+            raise SanitizedProviderError(
+                category=cat,
+                status_code=status,
+                details="Nebius API error occurred",
+            ) from None
         latency_ms = int((time.perf_counter() - t0) * 1000)
 
         choice = response.choices[0]
@@ -354,7 +450,7 @@ class NebiusNemotronProvider(LLMProvider):
         task_objective: str,
         available_tools: List[str],
         context_summary: Optional[str] = None,
-        max_tokens: int = 512,
+        max_tokens: int = 768,
     ) -> Optional[StructuredDecision]:
         """
         Ask Nemotron to produce a typed, schema-validated structured decision.
@@ -389,14 +485,19 @@ class NebiusNemotronProvider(LLMProvider):
             self.last_validation_error = "truncated"
             return None
 
+        if not res.content or not res.content.strip():
+            logger.warning("make_structured_decision: model returned empty completion.")
+            self.last_validation_error = "empty_completion"
+            return None
+
         if res.parsed_json is None:
             logger.warning("make_structured_decision: model returned unparseable output.")
             self.last_validation_error = "unparseable_json"
             return None
 
         decision = self._validate_structured_decision(res.parsed_json)
-        if decision is None:
-            self.last_validation_error = "malformed_output"
+        if decision is None and not self.last_validation_error:
+            self.last_validation_error = "SCHEMA_VALIDATION_ERROR"
         return decision
 
     def _validate_structured_decision(
@@ -408,24 +509,29 @@ class NebiusNemotronProvider(LLMProvider):
         """
         if not isinstance(raw, dict):
             logger.warning("StructuredDecision raw payload is not a dict.")
+            self.last_validation_error = "SCHEMA_NOT_OBJECT"
             return None
 
         # Disallow model attempting to set provenance
         if "provenance" in raw:
             logger.warning("StructuredDecision rejected: payload attempted to set 'provenance'.")
+            self.last_validation_error = "PROVENANCE_INJECTION_REJECTED"
             return None
 
         # Reject unknown top-level JSON fields
         unknown_fields = set(raw.keys()) - ALLOWED_STRUCTURED_DECISION_KEYS
         if unknown_fields:
             logger.warning("StructuredDecision rejected: unknown fields present: %s", unknown_fields)
+            self.last_validation_error = f"SCHEMA_UNKNOWN_FIELDS: {sorted(list(unknown_fields))}"
             return None
 
         if "tool" not in raw or not isinstance(raw.get("tool"), str):
             logger.warning("StructuredDecision missing/invalid 'tool' field.")
+            self.last_validation_error = "SCHEMA_MISSING_TOOL"
             return None
         if not raw["tool"].strip():
             logger.warning("StructuredDecision 'tool' field is empty.")
+            self.last_validation_error = "SCHEMA_EMPTY_TOOL"
             return None
 
         # Parse proposed postconditions (advisory — pipeline may override)
@@ -434,6 +540,7 @@ class NebiusNemotronProvider(LLMProvider):
         if raw_pcs is not None:
             if not isinstance(raw_pcs, list):
                 logger.warning("StructuredDecision 'proposed_postconditions' is not a list.")
+                self.last_validation_error = "SCHEMA_INVALID_POSTCONDITIONS"
                 return None
             for pc_raw in raw_pcs:
                 if isinstance(pc_raw, dict) and "predicate" in pc_raw:
@@ -445,6 +552,7 @@ class NebiusNemotronProvider(LLMProvider):
         args = raw.get("arguments", {})
         if not isinstance(args, dict):
             logger.warning("StructuredDecision 'arguments' is not a dict.")
+            self.last_validation_error = "SCHEMA_INVALID_ARGUMENTS"
             return None
 
         return StructuredDecision(
