@@ -59,7 +59,10 @@ class TestCleanStart(unittest.TestCase):
             html_text = resp.read().decode("utf-8")
 
         self.assertIn("Run Recovery Simulation", html_text)
-        self.assertIn("Real Nemotron (Nebius) Mode — Authorization Required", html_text)
+        # The tab title is always present; the subtitle suffix changes with key state.
+        self.assertIn("Real Nemotron (Nebius) Mode", html_text)
+        # Safety label is always rendered regardless of key state.
+        self.assertIn("ADVISORY ONLY", html_text)
         self.assertIn("UNKNOWN is not ABSENT", html_text)
         self.assertIn("480-Trial Comparative Benchmark", html_text)
 
