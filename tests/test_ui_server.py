@@ -295,6 +295,323 @@ class TestUIServer(unittest.TestCase):
             self.assertTrue(len(freeze_events) > 0)
             self.assertIn("from NVIDIA Nemotron proposal", freeze_events[0].get("detail", ""))
 
+    def test_17_dashboard_inline_js_syntax_clean(self):
+        """Dashboard inline JavaScript parses cleanly with 0 syntax errors and 0 duplicate declarations."""
+        import collections
+        import os
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        html_text = generate_dashboard_html()
+        start = html_text.find("<script>")
+        end = html_text.rfind("</script>")
+        self.assertGreater(start, 0, "No <script> tag found in dashboard HTML")
+        self.assertGreater(end, start, "Malformed <script> tag in dashboard HTML")
+        js_code = html_text[start + 8 : end]
+
+        # Check for duplicate top-level let/const declarations (prevents Identifier already declared SyntaxError)
+        decls = collections.defaultdict(list)
+        for i, line in enumerate(js_code.splitlines(), 1):
+            m = re.match(r"^(let|const)\s+([_a-zA-Z][_a-zA-Z0-9]*)", line)
+            if m:
+                decls[m.group(2)].append((i, m.group(1), line.strip()[:80]))
+        dups = {k: v for k, v in decls.items() if len(v) > 1}
+        self.assertEqual(dups, {}, f"Duplicate top-level let/const declarations found in inline JS: {dups}")
+
+        # If node is installed, run official syntax check
+        node_bin = shutil.which("node")
+        if node_bin:
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
+                f.write(js_code)
+                tmp_js = f.name
+            try:
+                proc = subprocess.run([node_bin, "--check", tmp_js], capture_output=True, text=True, timeout=10)
+                self.assertEqual(
+                    proc.returncode,
+                    0,
+                    f"node --check failed on inline JS:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+                )
+            finally:
+                try:
+                    os.unlink(tmp_js)
+                except OSError:
+                    pass
+
+    def test_18_browser_interactivity_and_clicks(self):
+        """In a real headless browser, clicks on navigation, scenarios, simulation, replay, reset succeed with 0 console errors."""
+        import json
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+
+        node_bin = shutil.which("node")
+        chrome_exe = None
+        for candidate in [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            shutil.which("google-chrome"),
+            shutil.which("chromium"),
+            shutil.which("msedge"),
+        ]:
+            if candidate and os.path.exists(candidate):
+                chrome_exe = candidate
+                break
+
+        if not (node_bin and chrome_exe):
+            self.skipTest("node or chrome/edge not found; skipping headless browser interaction test")
+
+        js_script = f"""
+const {{ spawn }} = require('child_process');
+
+async function run() {{
+  const chrome = spawn({json.dumps(chrome_exe)}, [
+    '--headless=new',
+    '--remote-debugging-port=0',
+    '--disable-gpu',
+    '--no-sandbox',
+    'about:blank'
+  ], {{ stdio: ['ignore', 'pipe', 'pipe'] }});
+
+  let wsUrl = null;
+  const portMatchPromise = new Promise((resolve, reject) => {{
+    const timer = setTimeout(() => reject(new Error('Chrome launch timeout')), 10000);
+    let buf = '';
+    chrome.stderr.on('data', chunk => {{
+      buf += chunk.toString();
+      const m = buf.match(/DevTools listening on ws:\\/\\/127\\.0\\.0\\.1:(\\d+)\\//);
+      if (m) {{
+        clearTimeout(timer);
+        resolve(m[1]);
+      }}
+    }});
+  }});
+
+  const debugPort = await portMatchPromise;
+  await new Promise(r => setTimeout(r, 500));
+  const tResp = await fetch('http://127.0.0.1:' + debugPort + '/json');
+  const targets = await tResp.json();
+  const pageTarget = targets.find(t => t.type === 'page') || targets[0];
+  const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+  let id = 1;
+  const pending = new Map();
+  const exceptions = [];
+
+  function send(method, params = {{}}) {{
+    return new Promise((resolve, reject) => {{
+      const mid = id++;
+      pending.set(mid, {{ resolve, reject }});
+      ws.send(JSON.stringify({{ id: mid, method, params }}));
+    }});
+  }}
+
+  ws.onmessage = e => {{
+    const d = JSON.parse(e.data);
+    if (d.id && pending.has(d.id)) {{
+      pending.get(d.id).resolve(d.result);
+      pending.delete(d.id);
+    }}
+    if (d.method === 'Runtime.exceptionThrown') {{
+      exceptions.push(d.params.exceptionDetails);
+    }}
+  }};
+
+  await new Promise(r => ws.onopen = r);
+  await send('Page.enable');
+  await send('Runtime.enable');
+
+  await send('Page.navigate', {{ url: 'http://127.0.0.1:{self.port}/' }});
+  await new Promise(r => setTimeout(r, 1500));
+
+  // 1. Navigation clicks
+  const navResults = await send('Runtime.evaluate', {{
+    expression: `(() => {{
+      const r = {{}};
+      for (const id of ['nav-mc', 'nav-scenarios', 'nav-evidence', 'nav-benchmark', 'nav-settings']) {{
+        const btn = document.getElementById(id);
+        if (btn) {{
+          btn.click();
+          r[id] = document.querySelector('.app-view.active')?.id;
+        }}
+      }}
+      return r;
+    }})()`,
+    returnByValue: true
+  }});
+
+  // 2. Scenario selector clicks
+  await send('Runtime.evaluate', {{ expression: `navigateTo('view-scenarios')` }});
+  const scResults = await send('Runtime.evaluate', {{
+    expression: `(() => {{
+      const r = {{}};
+      for (const sc of ['A', 'B', 'C', 'D', 'E']) {{
+        const pill = document.getElementById('pill-sc-' + sc);
+        if (pill) {{
+          pill.click();
+          r[sc] = _currentScenario;
+        }}
+      }}
+      return r;
+    }})()`,
+    returnByValue: true
+  }});
+
+  // 3. Run Recovery Simulation
+  await send('Runtime.evaluate', {{ expression: `selectScenario('B')` }});
+  await send('Runtime.evaluate', {{ expression: `document.getElementById('btnRun')?.click()` }});
+  await new Promise(r => setTimeout(r, 1800));
+
+  const runResults = await send('Runtime.evaluate', {{
+    expression: `(() => {{
+      return {{
+        runResultPresent: !!_runResult,
+        runId: _runResult?.run_id,
+        bannerText: document.getElementById('verificationBigBanner')?.innerText?.slice(0, 50),
+        eventCount: _eventLog?.length
+      }};
+    }})()`,
+    returnByValue: true
+  }});
+
+  // 4. Replay and Stop
+  const replayStart = await send('Runtime.evaluate', {{
+    expression: `(() => {{
+      const btn = document.getElementById('btnReplay');
+      if (btn) btn.click();
+      return {{ isReplaying: _isReplaying, btnText: btn?.innerText }};
+    }})()`,
+    returnByValue: true
+  }});
+
+  await new Promise(r => setTimeout(r, 800));
+
+  const replayStop = await send('Runtime.evaluate', {{
+    expression: `(() => {{
+      const btn = document.getElementById('btnReplay');
+      if (btn) btn.click();
+      return {{ isReplaying: _isReplaying, btnText: btn?.innerText }};
+    }})()`,
+    returnByValue: true
+  }});
+
+  // 5. Diagnostics toggle
+  const diagRes = await send('Runtime.evaluate', {{
+    expression: `(() => {{
+      const btn = document.getElementById('btnToggleDiagnostics');
+      const wrap = document.getElementById('advancedDiagnosticsWrap');
+      const before = wrap?.style.display;
+      if (btn) btn.click();
+      const after = wrap?.style.display;
+      return {{ before, after }};
+    }})()`,
+    returnByValue: true
+  }});
+
+  // 6. Reset
+  const resetRes = await send('Runtime.evaluate', {{
+    expression: `(() => {{
+      document.getElementById('btnReset')?.click();
+      return {{ runResult: _runResult, eventCount: _eventLog?.length }};
+    }})()`,
+    returnByValue: true
+  }});
+
+  ws.close();
+  chrome.kill();
+
+  console.log(JSON.stringify({{
+    exceptions,
+    navResults: navResults?.result?.value,
+    scResults: scResults?.result?.value,
+    runResults: runResults?.result?.value,
+    replayStart: replayStart?.result?.value,
+    replayStop: replayStop?.result?.value,
+    diagRes: diagRes?.result?.value,
+    resetRes: resetRes?.result?.value
+  }}));
+}}
+
+run().catch(err => {{
+  console.error(err);
+  process.exit(1);
+}});
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
+            f.write(js_script)
+            tmp_runner = f.name
+
+        try:
+            proc = subprocess.run([node_bin, tmp_runner], capture_output=True, text=True, encoding="utf-8", timeout=30)
+            if proc.returncode != 0:
+                self.fail(f"Node runner failed (code {proc.returncode}):\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}")
+            try:
+                res = json.loads(proc.stdout.strip().splitlines()[-1])
+            except Exception as e:
+                self.fail(f"JSON parse error: {e}\nFull STDOUT:\n{proc.stdout}\nFull STDERR:\n{proc.stderr}")
+            self.assertEqual(len(res["exceptions"]), 0, f"Uncaught exceptions in browser: {res['exceptions']}")
+            self.assertEqual(res["navResults"]["nav-mc"], "view-mission-control")
+            self.assertEqual(res["navResults"]["nav-scenarios"], "view-scenarios")
+            self.assertEqual(res["navResults"]["nav-evidence"], "view-evidence")
+            self.assertEqual(res["navResults"]["nav-benchmark"], "view-benchmark")
+            self.assertEqual(res["scResults"], {"A": "A", "B": "B", "C": "C", "D": "D", "E": "E"})
+            self.assertTrue(res["runResults"]["runResultPresent"])
+            self.assertEqual(res["runResults"]["eventCount"], 12)
+            self.assertTrue(res["replayStart"]["isReplaying"])
+            self.assertFalse(res["replayStop"]["isReplaying"])
+            self.assertIsNone(res["resetRes"]["runResult"])
+            self.assertEqual(res["resetRes"]["eventCount"], 0)
+        finally:
+            try:
+                os.unlink(tmp_runner)
+            except OSError:
+                pass
+
+
+    def test_19_benchmark_endpoint_sample(self):
+        """POST /api/run_benchmark?sample=1 returns ok status, 80 trials, and all 5 arm aggregates."""
+        req = urllib.request.Request(
+            self._url("/api/run_benchmark?sample=1"),
+            data=b"",
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
+
+        self.assertEqual(data["status"], "ok", f"Benchmark returned non-ok: {data.get('error')}")
+        self.assertGreaterEqual(data["total_trials"], 80)
+        self.assertIn("arm_aggregates", data)
+        self.assertIn("trials", data)
+        self.assertTrue(data["is_sample"])
+
+        expected_arms = {"REAGENT_CONTRACT", "SHARED_OBSERVATION", "TOOL_CLAIM_ONLY", "NAIVE_RETRY", "ALWAYS_ESCALATE"}
+        self.assertEqual(set(data["arm_aggregates"].keys()), expected_arms)
+
+        reagent = data["arm_aggregates"]["REAGENT_CONTRACT"]
+        self.assertEqual(reagent["false_verified_count"], 0,
+                         "REAGENT_CONTRACT must have 0 false verifications")
+        self.assertEqual(reagent["unsafe_retry_count"], 0,
+                         "REAGENT_CONTRACT must have 0 unsafe retries")
+
+        self.assertGreater(len(data["trials"]), 0)
+        first_trial = data["trials"][0]
+        for field_name in ("trial_id", "task_id", "fault_mode", "arm", "oracle_verdict"):
+            self.assertIn(field_name, first_trial,
+                          f"Trial missing expected field: {field_name}")
+
+        # Verify submission artifact is unchanged
+        from pathlib import Path
+        artifact_path = Path("reports/dbops/comparative_evaluation_results.json")
+        if artifact_path.exists():
+            import hashlib
+            with open(artifact_path, "rb") as f:
+                content = f.read()
+            # Just verify it is still valid JSON (not corrupted by the run)
+            json.loads(content)
+
 
 if __name__ == "__main__":
     unittest.main()

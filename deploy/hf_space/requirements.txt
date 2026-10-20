@@ -1,0 +1,6 @@
+# ReAgent Deployment Dependencies (Hugging Face Spaces & Container Runtime)
+pydantic>=2.0.0
+filelock>=3.0.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+requests>=2.28.0

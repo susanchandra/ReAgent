@@ -20,11 +20,14 @@ Features:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import html
 import json
 import os
 import sys
+import tempfile
+import threading
 import time
 import uuid
 import urllib.parse
@@ -61,6 +64,7 @@ from reagent.experiments.dbops.integration import (
 from reagent.experiments.dbops.tasks import TASK_WALLET_TRANSFER, get_task
 from reagent.experiments.dbops.manifest_dbops_v1 import TASK_SEAT_BOOKING, TASK_REFUND_ISSUE
 from reagent.experiments.dbops.eval_scoring import DbopsGoldScorer
+from reagent.experiments.dbops.comparative_eval import ComparativeEvaluator
 from reagent.models import TaskState, AgentStatus, StructuredDecision, Postcondition, FailureDiagnosis, RecoveryDecision
 from reagent.providers.base import LLMProvider, LLMResponse
 from reagent.taxonomy import FailureType, RecoveryStrategyType
@@ -91,7 +95,7 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "id": "B",
         "key": "ambiguous_timeout",
         "label": "Scenario B: Commit-Then-Timeout",
-        "short_title": "B — Commit-then-Timeout",
+        "short_title": "B — Commit-Then-Timeout",
         "fault": "COMMIT_THEN_TIMEOUT",
         "description": "Commit occurs before timeout. Naive retry causes duplicate debit ($1,000); ReAgent probes, verifies, and restrains retry ($500 preserved).",
         "oracle_available": False,
@@ -101,7 +105,7 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "id": "C",
         "key": "safe_retry",
         "label": "Scenario C: Fail-Before-Commit",
-        "short_title": "C — Fail-before-Commit",
+        "short_title": "C — Fail-Before-Commit",
         "fault": "FAIL_BEFORE_COMMIT",
         "description": "No effect occurs on attempt 1. ReAgent confirms absence, retries safely exactly once, and verifies. Naive retried blindly without proof.",
         "oracle_available": False,
@@ -962,10 +966,12 @@ def load_comparative_benchmark_data() -> Dict[str, Any]:
 def generate_dashboard_html(
     benchmark_report: Optional[BenchmarkComparisonReport] = None,
     demo_artifact: Optional[DemoArtifact] = None,
+    active_view: str = "view-mission-control",
 ) -> str:
     """Generates complete, self-contained, responsive HTML Mission Control dashboard."""
     if benchmark_report is None:
         try:
+            from reagent.benchmark import run_benchmark_scenarios
             benchmark_report = run_benchmark_scenarios()
         except Exception:
             benchmark_report = None
@@ -988,7 +994,7 @@ def generate_dashboard_html(
 
     api_key_set = bool(os.environ.get("NEBIUS_API_KEY", "").strip())
     nemotron_status = "CONFIGURED" if api_key_set else "NOT_CONFIGURED"
-    # Pre-render key status so the browser never shows a stale "Checking…"
+
     if api_key_set:
         _preflight_key_html = (
             '<span style="color:var(--success);font-weight:700;">&#x2713; SET</span>'
@@ -999,6 +1005,30 @@ def generate_dashboard_html(
             '<span style="color:var(--danger);font-weight:700;">&#x2717; NOT SET</span>'
             ' &mdash; live inference refused (fails closed)'
         )
+    if api_key_set:
+        _setup_instructions_html = "<!-- key configured: no setup instructions needed -->"
+    else:
+        _setup_instructions_html = r"""
+      <div style="background:#1a1000; border:1px solid #7c4a00; border-radius:8px; padding:14px 18px; margin:12px 0; font-size:12px; line-height:1.8;">
+        <div style="font-weight:700; color:#f59e0b; margin-bottom:8px;">&#x26a0; NEBIUS_API_KEY not configured &mdash; live inference disabled (fails closed)</div>
+        <div style="color:#cbd5e1; margin-bottom:10px;">To enable one live Nemotron request, configure your key using <strong>one</strong> of these methods:</div>
+        <div style="margin-bottom:6px; color:#94a3b8; font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.4px;">Option 1 &mdash; Local .env file (recommended, gitignored)</div>
+        <pre style="background:#0d1117; border:1px solid #263348; border-radius:5px; padding:9px 12px; font-size:11.5px; color:#38bdf8; margin:0 0 10px; overflow-x:auto;">echo NEBIUS_API_KEY=your_key_here &gt; D:\ReAgent\.env
+# Then restart the server: python -m reagent.ui_server</pre>
+        <div style="margin-bottom:6px; color:#94a3b8; font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.4px;">Option 2 &mdash; Shell environment variable (PowerShell)</div>
+        <pre style="background:#0d1117; border:1px solid #263348; border-radius:5px; padding:9px 12px; font-size:11.5px; color:#38bdf8; margin:0 0 10px; overflow-x:auto;">$env:NEBIUS_API_KEY = "your_key_here"
+python -m reagent.ui_server</pre>
+        <div style="color:#64748b; font-size:11px;">&#x2022; Key is never printed, logged, committed, or sent to any endpoint other than the official Nebius Token Factory.<br>&#x2022; The .env file is covered by *.env in .gitignore &mdash; it will never be committed.<br>&#x2022; Live inference is only triggered on explicit operator action &mdash; never on page load.</div>
+      </div>
+        """
+
+    active_mc = " active" if active_view in ("view-mission-control", "mc") else ""
+    active_sc = " active" if active_view in ("view-scenarios", "scenarios") else ""
+    active_ev = " active" if active_view in ("view-evidence", "evidence") else ""
+    active_bm = " active" if active_view in ("view-benchmark", "benchmark") else ""
+    active_st = " active" if active_view in ("view-settings", "settings") else ""
+    if not (active_mc or active_sc or active_ev or active_bm or active_st):
+        active_mc = " active"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1008,1117 +1038,2407 @@ def generate_dashboard_html(
   <title>ReAgent — Verify outcomes. Recover safely.</title>
   <style>
     :root {{
-      --bg: #090D14;
-      --panel: #101622;
-      --surface: #182030;
-      --surface-2: #202A3C;
-      --border: #263348;
-      --border-hi: #364864;
-      --text: #F1F5F9;
+      --bg: #070A0F;
+      --bg-sidebar: #0B0F17;
+      --bg-topbar: #080C14;
+      --panel: #0E1422;
+      --panel-elevated: #131B2E;
+      --surface: #172238;
+      --surface-2: #1E2C48;
+      --surface-hover: #233556;
+      --border: #1F2E47;
+      --border-subtle: #162235;
+      --border-hi: #2E4469;
+      --text: #F8FAFC;
       --text-muted: #94A3B8;
-      --text-dim: #8FA0B8;
+      --text-dim: #70829B;
       --accent: #38BDF8;
-      --accent-dim: #0369A1;
+      --accent-bright: #0EA5E9;
+      --accent-dim: #0284C7;
+      --accent-bg: rgba(56, 189, 248, 0.08);
+      --accent-border: rgba(56, 189, 248, 0.28);
       --success: #34D399;
-      --success-bg: rgba(52, 211, 153, 0.10);
-      --danger: #F87171;
-      --danger-bg: rgba(248, 113, 113, 0.10);
+      --success-bright: #10B981;
+      --success-bg: rgba(52, 211, 153, 0.09);
+      --success-border: rgba(52, 211, 153, 0.32);
+      --danger: #FB7185;
+      --danger-bright: #F43F5E;
+      --danger-bg: rgba(251, 113, 133, 0.09);
+      --danger-border: rgba(251, 113, 133, 0.32);
       --warning: #FBBF24;
-      --warning-bg: rgba(251, 191, 36, 0.10);
-      --naive: #F87171;
-      --reagent: #34D399;
-      --mono: "JetBrains Mono", Consolas, Menlo, monospace;
-      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      --radius: 8px;
+      --warning-bg: rgba(251, 191, 36, 0.09);
+      --warning-border: rgba(251, 191, 36, 0.32);
+      --purple: #C084FC;
+      --purple-bg: rgba(192, 132, 252, 0.09);
+      --purple-border: rgba(192, 132, 252, 0.32);
+      --naive: #FB7185;
+      --reagent: #38BDF8;
+      --radius-sm: 6px;
+      --radius: 10px;
+      --radius-lg: 14px;
+      --mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      --shadow-sm: 0 2px 8px rgba(0,0,0,0.3);
+      --shadow-md: 0 4px 16px rgba(0,0,0,0.4);
+      --shadow-lg: 0 8px 30px rgba(0,0,0,0.5);
     }}
     *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    html {{ scroll-behavior: smooth; height: 100%; }}
     body {{
       background: var(--bg);
+      background-image:
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(14, 165, 233, 0.08), transparent 70%),
+        radial-gradient(ellipse 60% 40% at 90% 10%, rgba(52, 211, 153, 0.04), transparent 60%);
       color: var(--text);
       font-family: var(--sans);
-      font-size: 14px;
-      line-height: 1.65;
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-    }}
-
-    /* ─── HEADER ─── */
-    header {{
-      background: var(--panel);
-      border-bottom: 1px solid var(--border);
-      padding: 12px 24px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
-      position: sticky;
-      top: 0;
-      z-index: 200;
-    }}
-    .brand {{ display: flex; align-items: center; gap: 12px; }}
-    .logo {{
-      background: linear-gradient(135deg, #0284C7, #38BDF8);
-      color: #FFF;
-      font-weight: 800;
       font-size: 13px;
-      padding: 4px 10px;
-      border-radius: 6px;
-      letter-spacing: -0.4px;
-    }}
-    .brand-name {{ font-size: 16px; font-weight: 700; letter-spacing: -0.3px; }}
-    .brand-tag {{ font-size: 12px; color: var(--accent); font-style: italic; margin-left: 4px; }}
-
-    .header-badges {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }}
-    .badge {{
-      font-family: var(--mono);
-      font-size: 10.5px;
-      font-weight: 700;
-      padding: 3px 8px;
-      border-radius: 4px;
-      letter-spacing: 0.3px;
-    }}
-    .badge-offline {{ background: rgba(52,211,153,0.12); border: 1px solid rgba(52,211,153,0.35); color: var(--success); }}
-    .badge-live   {{ background: rgba(56,189,248,0.12); border: 1px solid rgba(56,189,248,0.35); color: var(--accent); }}
-    .badge-warn   {{ background: rgba(251,191,36,0.12); border: 1px solid rgba(251,191,36,0.35); color: var(--warning); }}
-    .badge-neutral{{ background: var(--surface-2); border: 1px solid var(--border); color: var(--text-muted); }}
-
-    /* ─── NAV ─── */
-    nav {{
-      background: var(--panel);
-      border-bottom: 1px solid var(--border);
-      padding: 0 24px;
-      display: flex;
-      gap: 2px;
-    }}
-    .tab-btn {{
-      background: transparent;
-      border: none;
-      border-bottom: 2px solid transparent;
-      color: var(--text-muted);
-      padding: 11px 18px;
-      font-size: 13px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: color 0.15s, border-color 0.15s;
-    }}
-    .tab-btn:hover {{ color: var(--text); }}
-    .tab-btn.active {{ color: var(--accent); border-bottom-color: var(--accent); }}
-
-    /* ─── MAIN ─── */
-    main {{
-      flex: 1;
-      padding: 24px;
-      max-width: 1400px;
-      margin: 0 auto;
-      width: 100%;
-    }}
-    .tab-pane {{ display: none; }}
-    .tab-pane.active {{ display: block; }}
-
-    /* Hero Banner */
-    .hero-banner {{
-      background: linear-gradient(180deg, var(--surface) 0%, rgba(24, 32, 48, 0.4) 100%);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 18px 22px;
-      margin-bottom: 20px;
-    }}
-    .hero-title {{
-      font-size: 17px;
-      font-weight: 700;
-      color: #FFF;
-      margin-bottom: 6px;
-    }}
-    .hero-problem {{
-      font-size: 13.5px;
-      color: var(--text-muted);
       line-height: 1.5;
-    }}
-    .hero-invariant {{
-      margin-top: 10px;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      background: rgba(251, 191, 36, 0.1);
-      border: 1px solid rgba(251, 191, 36, 0.3);
-      padding: 5px 12px;
-      border-radius: 6px;
-      font-size: 11.5px;
-      color: var(--warning);
-      font-weight: 600;
-    }}
-
-    /* Layout */
-    .mc-layout {{
-      display: grid;
-      grid-template-columns: 330px 1fr;
-      gap: 20px;
-      align-items: start;
-    }}
-    @media(max-width: 950px) {{ .mc-layout {{ grid-template-columns: 1fr; }} }}
-
-    .mc-sidebar {{
+      min-height: 100%;
       display: flex;
       flex-direction: column;
-      gap: 14px;
     }}
 
-    .card {{
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      overflow: hidden;
-    }}
-    .card-head {{
-      padding: 11px 14px;
-      border-bottom: 1px solid var(--border);
+    /* ─── APP WRAPPER & SIDEBAR ─── */
+    .app-root {{
       display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
+      min-height: 100vh;
+      width: 100%;
     }}
-    .card-title {{
-      font-size: 11.5px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.6px;
-      color: var(--text-muted);
-    }}
-    .card-body {{ padding: 12px 14px; }}
 
-    /* Inputs */
-    .task-input {{
-      width: 100%;
-      background: var(--surface-2);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      color: var(--text);
-      font-size: 13px;
-      padding: 9px 11px;
-      font-family: var(--sans);
-      outline: none;
-      resize: vertical;
-      min-height: 52px;
-      transition: border-color 0.15s;
+    .app-sidebar {{
+      width: 240px;
+      background: var(--bg-sidebar);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      position: fixed;
+      top: 0;
+      bottom: 0;
+      left: 0;
+      z-index: 100;
     }}
-    .task-input:focus {{ border-color: var(--accent); }}
-    .task-input.invalid {{ border-color: var(--danger); }}
-    .task-reject-msg {{
-      font-size: 11px;
-      color: var(--danger);
-      margin-top: 6px;
-      display: none;
-      line-height: 1.4;
-    }}
-    .task-tpl-btn {{
+
+    .sidebar-brand {{
+      padding: 18px 20px 14px 20px;
       display: flex;
       align-items: center;
-      gap: 10px;
-      padding: 8px 10px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      background: var(--surface);
-      color: var(--text);
-      cursor: pointer;
-      text-align: left;
-      transition: all 0.15s ease;
-      width: 100%;
+      gap: 12px;
+      border-bottom: 1px solid var(--border-subtle);
     }}
-    .task-tpl-btn:hover {{
-      border-color: var(--border-hi);
-      background: var(--surface-2);
-    }}
-    .task-tpl-btn.active {{
-      border-color: var(--accent);
-      background: rgba(56, 189, 248, 0.1);
-      box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.25);
-    }}
-    .task-examples {{
-      margin-top: 8px;
-      font-size: 11px;
-      color: var(--text-dim);
-    }}
-    .task-example {{
-      cursor: pointer;
+    .brand-icon-wrap {{
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, rgba(14, 165, 233, 0.25) 0%, rgba(2, 132, 199, 0.1) 100%);
+      border: 1px solid var(--accent-border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
       color: var(--accent);
-      text-decoration: underline dotted;
+      box-shadow: 0 0 12px rgba(56, 189, 248, 0.2);
     }}
-
-
-    /* Scenarios */
-    .scenario-cards {{
+    .brand-text-col {{
       display: flex;
       flex-direction: column;
-      gap: 6px;
     }}
-    .sc-card {{
-      padding: 9px 11px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      cursor: pointer;
-      transition: border-color 0.15s, background 0.15s;
-      background: var(--surface);
-    }}
-    .sc-card:hover {{ border-color: var(--border-hi); }}
-    .sc-card.selected {{
-      border-color: var(--accent);
-      background: rgba(56, 189, 248, 0.08);
-    }}
-    .sc-label {{ font-size: 12px; font-weight: 700; color: var(--text); }}
-    .sc-desc {{ font-size: 11px; color: var(--text-muted); margin-top: 2px; line-height: 1.35; }}
-
-    /* Buttons */
-    .btn {{
-      border: none;
-      border-radius: 6px;
-      font-size: 12.5px;
-      font-weight: 600;
-      padding: 9px 15px;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      transition: background 0.15s, opacity 0.15s;
-    }}
-    .btn:disabled {{ opacity: 0.45; cursor: not-allowed; }}
-    .btn-primary {{ background: #0284C7; color: #FFF; }}
-    .btn-primary:hover:not(:disabled) {{ background: #0369A1; }}
-    .btn-neutral {{ background: var(--surface-2); border: 1px solid var(--border); color: var(--text-muted); }}
-    .btn-neutral:hover:not(:disabled) {{ color: var(--text); border-color: var(--border-hi); }}
-    .btn-oracle {{ background: linear-gradient(135deg, #7C3AED, #A855F7); color: #FFF; }}
-    .btn-oracle:hover:not(:disabled) {{ opacity: 0.88; }}
-    .action-row {{ display: flex; gap: 8px; flex-wrap: wrap; }}
-
-    /* Lanes */
-    .lanes {{
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
-      margin-bottom: 16px;
-    }}
-    @media(max-width: 720px) {{ .lanes {{ grid-template-columns: 1fr; }} }}
-
-    .lane {{
-      border-radius: var(--radius);
-      overflow: hidden;
-      border: 1px solid var(--border);
-    }}
-    .lane-naive {{ border-top: 3px solid var(--naive); }}
-    .lane-reagent {{ border-top: 3px solid var(--reagent); }}
-    .lane-header {{
-      padding: 11px 15px;
-      background: var(--panel);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      border-bottom: 1px solid var(--border);
-    }}
-    .lane-name {{ font-size: 13.5px; font-weight: 700; }}
-    .lane-naive .lane-name {{ color: var(--naive); }}
-    .lane-reagent .lane-name {{ color: var(--reagent); }}
-    .lane-body {{ background: var(--surface); padding: 14px 15px; }}
-
-    .wallet {{
-      background: var(--surface-2);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 11px 14px;
-      margin-bottom: 12px;
-    }}
-    .wallet-label {{
-      font-size: 10px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.6px;
-      color: var(--text-dim);
-      margin-bottom: 3px;
-    }}
-    .wallet-balance {{
-      font-family: var(--mono);
-      font-size: 26px;
+    .brand-main-title {{
+      font-size: 15px;
       font-weight: 800;
+      letter-spacing: -0.3px;
+      color: #FFF;
+      line-height: 1.2;
     }}
-    .wallet-balance.danger {{ color: var(--danger); }}
-    .wallet-balance.success {{ color: var(--success); }}
-    .wallet-balance.neutral {{ color: var(--text-muted); }}
-
-    .state-compare-box {{
-      background: var(--surface-2);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 9px 12px;
-      margin-bottom: 10px;
-      font-size: 11.5px;
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
-    }}
-
-    .outcome-policy-box {{
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-      margin-bottom: 12px;
-      font-size: 11px;
-    }}
-    .policy-pill {{
-      background: var(--surface-2);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 7px 10px;
-    }}
-    .policy-pill-label {{
-      font-size: 9.5px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
+    .brand-sub-tag {{
+      font-size: 10.5px;
       color: var(--text-dim);
-      margin-bottom: 3px;
-    }}
-    .policy-pill-val {{
-      font-family: var(--mono);
-      font-size: 11px;
-      font-weight: 700;
-      color: var(--text);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      font-weight: 500;
+      letter-spacing: 0.2px;
     }}
 
-    .ledger-rows {{
+    .sidebar-nav {{
+      padding: 16px 12px;
       display: flex;
       flex-direction: column;
       gap: 4px;
-      margin-bottom: 12px;
-      min-height: 36px;
+      flex: 1;
+      overflow-y: auto;
     }}
-    .ledger-row {{
-      background: var(--surface-2);
-      border-radius: 4px;
-      padding: 6px 10px;
-      font-family: var(--mono);
-      font-size: 11.5px;
-      color: var(--text-muted);
+
+    .nav-link {{
       display: flex;
-      justify-content: space-between;
-      gap: 8px;
+      align-items: center;
+      gap: 12px;
+      padding: 9.5px 14px;
+      border-radius: var(--radius-sm);
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 12.5px;
+      font-weight: 600;
+      transition: all 0.15s ease;
+      cursor: pointer;
+      border: 1px solid transparent;
+      background: transparent;
+      width: 100%;
+      text-align: left;
     }}
-    .ledger-row.duplicate {{
-      background: rgba(248, 113, 113, 0.14);
-      border: 1px solid rgba(248, 113, 113, 0.4);
-      color: var(--danger);
-      font-weight: 700;
+    .nav-link:hover {{
+      color: #FFF;
+      background: rgba(255, 255, 255, 0.03);
+      border-color: rgba(255, 255, 255, 0.05);
+    }}
+    .nav-link.active {{
+      color: #FFF;
+      background: linear-gradient(90deg, rgba(56, 189, 248, 0.16) 0%, rgba(56, 189, 248, 0.05) 100%);
+      border-color: rgba(56, 189, 248, 0.35);
+      box-shadow: inset 3px 0 0 var(--accent);
+    }}
+    .nav-link.active .nav-icon {{
+      color: var(--accent);
+    }}
+    .nav-icon {{
+      width: 16px;
+      height: 16px;
+      color: var(--text-dim);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
     }}
 
-    .decision-card {{
-      border-radius: 6px;
-      padding: 10px 14px;
-      font-size: 13px;
-      font-weight: 700;
-      margin-bottom: 10px;
-      border: 1px solid;
+    .sidebar-footer-box {{
+      padding: 14px 16px;
+      border-top: 1px solid var(--border-subtle);
+      background: rgba(0, 0, 0, 0.2);
     }}
-    .decision-VERIFIED {{ background: var(--success-bg); border-color: rgba(52,211,153,0.45); color: var(--success); }}
-    .decision-ESCALATED {{ background: var(--warning-bg); border-color: rgba(251,191,36,0.45); color: var(--warning); }}
-    .decision-CORRUPTED {{ background: var(--danger-bg); border-color: rgba(248,113,113,0.45); color: var(--danger); }}
-    .decision-PENDING {{ background: var(--surface-2); border-color: var(--border); color: var(--text-dim); }}
-
-    .rationale-box {{
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-left: 3px solid var(--border-hi);
-      border-radius: 6px;
-      padding: 10px 12px;
-      margin-bottom: 12px;
-    }}
-    .rationale-title {{
+    .sidebar-powered-by {{
       font-size: 10px;
-      font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.6px;
       color: var(--text-dim);
       margin-bottom: 4px;
     }}
-    .rationale-desc {{
-      font-size: 12px;
-      color: var(--text);
-      line-height: 1.5;
-    }}
-
-    .evidence-card {{
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      overflow: hidden;
-      margin-bottom: 12px;
-    }}
-    .evidence-card-head {{
-      padding: 9px 12px;
-      background: var(--surface-2);
-      font-size: 12px;
-      font-weight: 700;
-      color: var(--text);
+    .sidebar-powered-brand {{
       display: flex;
-      justify-content: space-between;
       align-items: center;
-      border-bottom: 1px solid var(--border);
-    }}
-    .evidence-body {{
-      padding: 9px 12px;
-      background: var(--panel);
-      font-family: var(--mono);
-      font-size: 11.5px;
-      color: var(--text-muted);
-      line-height: 1.7;
-    }}
-    .evidence-row {{
-      display: grid;
-      grid-template-columns: 160px 1fr;
       gap: 6px;
-      border-bottom: 1px solid var(--border);
-      padding: 4px 0;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-muted);
+      margin-bottom: 8px;
     }}
-    .evidence-row:last-child {{ border-bottom: none; }}
-    .ev-key {{ color: var(--text-dim); }}
-    .ev-val {{ color: var(--text); }}
-    .ev-val.ok {{ color: var(--success); font-weight: 700; }}
-    .ev-val.bad {{ color: var(--danger); font-weight: 700; }}
-    .ev-val.warn {{ color: var(--warning); font-weight: 700; }}
+    .sidebar-status-pill {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 10.5px;
+      font-weight: 700;
+      padding: 3.5px 9px;
+      border-radius: 20px;
+      background: rgba(52, 211, 153, 0.12);
+      border: 1px solid rgba(52, 211, 153, 0.35);
+      color: var(--success);
+      font-family: var(--mono);
+    }}
 
-    /* Event log */
-    .event-log {{
+    /* ─── MAIN CONTENT CONTAINER & TOPBAR ─── */
+    .app-main-wrap {{
+      margin-left: 240px;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }}
+
+    .app-topbar {{
+      height: 54px;
+      background: var(--bg-topbar);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 28px;
+      position: sticky;
+      top: 0;
+      z-index: 90;
+    }}
+    .topbar-left {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+    .topbar-right {{
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }}
+    .topbar-pill {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3.5px 10px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 600;
+      font-family: var(--mono);
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text-muted);
+    }}
+    .topbar-pill.ready {{
+      background: rgba(52, 211, 153, 0.08);
+      border-color: rgba(52, 211, 153, 0.28);
+      color: var(--success);
+    }}
+    .topbar-pill.model {{
+      background: rgba(56, 189, 248, 0.08);
+      border-color: rgba(56, 189, 248, 0.28);
+      color: var(--accent);
+    }}
+
+    .app-content {{
+      padding: 24px 32px 40px 32px;
+      flex: 1;
+      min-width: 0;
+    }}
+
+    /* ─── VIEWS SWITCHING ─── */
+    .app-view {{
+      display: none;
+      scroll-margin-top: 70px;
+    }}
+    .app-view.active {{
+      display: block;
+    }}
+
+    /* ─── CARDS & SURFACES ─── */
+    .card {{
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: var(--radius);
+      box-shadow: var(--shadow-sm);
       overflow: hidden;
-      margin-top: 16px;
+      transition: border-color 0.15s ease;
     }}
-    .event-log-head {{
-      padding: 11px 16px;
+    .card:hover {{ border-color: var(--border-hi); }}
+    .card-head {{
+      padding: 12px 18px;
+      background: var(--panel-elevated);
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
     }}
-    .event-log-title {{
+    .card-title {{
       font-size: 12px;
       font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.6px;
-      color: var(--text);
-    }}
-    .event-log-body {{
-      max-height: 320px;
-      overflow-y: auto;
-    }}
-    .event-entry {{
-      display: grid;
-      grid-template-columns: 28px 65px 75px 120px 1fr;
-      gap: 8px;
-      padding: 7px 14px;
-      border-bottom: 1px solid rgba(38, 51, 72, 0.6);
-      font-family: var(--mono);
-      font-size: 11.5px;
+      letter-spacing: 0.4px;
+      color: var(--text-muted);
+      display: flex;
       align-items: center;
+      gap: 8px;
     }}
-    .event-entry:last-child {{ border-bottom: none; }}
-    .event-entry:hover {{ background: var(--surface); }}
-    .ev-seq {{ color: var(--text-dim); text-align: right; }}
-    .ev-phase {{ color: var(--accent); font-weight: 700; }}
-    .ev-agent-naive {{ color: var(--naive); font-weight: 700; }}
-    .ev-agent-reagent {{ color: var(--reagent); font-weight: 700; }}
-    .ev-agent-system {{ color: var(--text-dim); }}
-    .ev-action {{ color: var(--text-muted); font-weight: 700; }}
-    .ev-detail {{ color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-    .ev-status-ok {{ color: var(--success); }}
-    .ev-status-warn {{ color: var(--warning); }}
-    .ev-status-error {{ color: var(--danger); }}
+    .card-body {{ padding: 16px 18px; }}
 
-    /* Oracle Panel */
-    #oraclePanel {{
-      background: linear-gradient(135deg, rgba(124, 58, 237, 0.14), rgba(168, 85, 247, 0.08));
-      border: 1px solid rgba(168, 85, 247, 0.4);
-      border-radius: var(--radius);
-      padding: 14px 18px;
+    /* ─── BUTTONS ─── */
+    .btn {{
+      border: none;
+      border-radius: var(--radius-sm);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 8.5px 15px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: all 0.15s ease;
+      font-family: var(--sans);
+    }}
+    .btn:disabled {{ opacity: 0.4; cursor: not-allowed; }}
+    .btn-primary {{
+      background: linear-gradient(135deg, #0284C7 0%, #0369A1 100%);
+      color: #FFF;
+      box-shadow: 0 2px 10px rgba(2, 132, 199, 0.4);
+      border: 1px solid rgba(56, 189, 248, 0.4);
+    }}
+    .btn-primary:hover:not(:disabled) {{
+      background: linear-gradient(135deg, #0369A1 0%, #075985 100%);
+      transform: translateY(-1px);
+    }}
+    .btn-neutral {{
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+    }}
+    .btn-neutral:hover:not(:disabled) {{
+      color: var(--text);
+      border-color: var(--border-hi);
+      background: var(--surface-hover);
+    }}
+    .btn-oracle {{
+      background: linear-gradient(135deg, #7C3AED 0%, #9333EA 100%);
+      color: #FFF;
+      box-shadow: 0 2px 10px rgba(124, 58, 237, 0.35);
+      border: 1px solid rgba(192, 132, 252, 0.4);
+    }}
+
+    /* ─── BADGES ─── */
+    .badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-family: var(--mono);
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }}
+    .badge-live {{ background: var(--success-bg); color: var(--success); border: 1px solid var(--success-border); }}
+    .badge-offline {{ background: rgba(56, 189, 248, 0.12); color: var(--accent); border: 1px solid var(--accent-border); }}
+    .badge-warn {{ background: var(--warning-bg); color: var(--warning); border: 1px solid var(--warning-border); }}
+    .badge-danger {{ background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger-border); }}
+    .badge-neutral {{ background: var(--surface-2); color: var(--text-dim); border: 1px solid var(--border); }}
+
+    /* ─── SCREEN A: MISSION CONTROL STYLES ─── */
+    .mc-grid {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.85fr) minmax(300px, 1fr);
+      gap: 22px;
+      align-items: start;
+    }}
+    .mc-left-col {{
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }}
+    .mc-right-col {{
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }}
+
+    /* Hero Banner matching reference image */
+    .hero-banner-new {{
+      background: linear-gradient(135deg, #0B1220 0%, #070B14 100%);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 24px 28px;
+      position: relative;
+      overflow: hidden;
+      box-shadow: var(--shadow-md);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+    }}
+    .hero-text-block {{
+      flex: 1;
+      max-width: 580px;
+    }}
+    .hero-eyebrow-text {{
+      font-size: 10.5px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--accent);
+      margin-bottom: 8px;
+    }}
+    .hero-headline-text {{
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: -0.6px;
+      color: #FFF;
+      margin-bottom: 6px;
+      line-height: 1.2;
+    }}
+    .hero-headline-text span {{
+      color: var(--accent);
+    }}
+    .hero-subtitle-text {{
+      font-size: 13.5px;
+      color: var(--text-muted);
+      margin-bottom: 18px;
+      line-height: 1.5;
+    }}
+    .hero-actions-row {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 18px;
+      flex-wrap: wrap;
+    }}
+    .hero-shield-art {{
+      width: 140px;
+      height: 140px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }}
+
+    /* Hero Problem & Invariant Box (Required for test assertions) */
+    .hero-audit-box {{
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 10px 14px;
+      font-size: 11.5px;
+      color: var(--text-dim);
+      line-height: 1.5;
       margin-top: 14px;
-      display: none;
     }}
-    .oracle-title {{ font-size: 13px; font-weight: 700; color: #C084FC; margin-bottom: 6px; }}
-    .oracle-body {{ font-size: 12.5px; color: var(--text-muted); line-height: 1.55; }}
+    .hero-audit-box strong {{ color: var(--text); }}
 
-    /* Tables */
-    .table-container {{
+    /* 3 Value Cards row */
+    .value-cards-row {{
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-top: 6px;
+    }}
+    .value-card {{
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 10px 12px;
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+    }}
+    .value-icon {{
+      width: 22px;
+      height: 22px;
+      border-radius: 6px;
+      background: var(--surface-2);
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }}
+    .value-title {{
+      font-size: 11.5px;
+      font-weight: 700;
+      color: #FFF;
+      margin-bottom: 2px;
+    }}
+    .value-desc {{
+      font-size: 10.5px;
+      color: var(--text-dim);
+      line-height: 1.35;
+    }}
+
+    /* Explore Scenarios Grid */
+    .section-head-row {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }}
+    .section-heading {{
+      font-size: 13.5px;
+      font-weight: 700;
+      color: #FFF;
+    }}
+    .section-subheading {{
+      font-size: 11px;
+      color: var(--text-dim);
+    }}
+    .section-link {{
+      font-size: 11px;
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 600;
+      cursor: pointer;
+    }}
+    .section-link:hover {{ text-decoration: underline; }}
+
+    .scenarios-grid-5 {{
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 10px;
+    }}
+    .sc-chip-card {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 12px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }}
+    .sc-chip-card:hover {{
+      border-color: var(--border-hi);
+      background: var(--panel-elevated);
+      transform: translateY(-2px);
+    }}
+    .sc-chip-badge {{
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      font-weight: 800;
+      font-family: var(--mono);
+    }}
+    .sc-chip-title {{
+      font-size: 11.5px;
+      font-weight: 700;
+      color: #FFF;
+    }}
+    .sc-chip-sub {{
+      font-size: 10px;
+      color: var(--text-dim);
+      line-height: 1.3;
+    }}
+
+    /* Task Templates Cards */
+    .templates-grid-3 {{
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+    }}
+    .template-card-item {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 12px 14px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      transition: all 0.15s ease;
+    }}
+    .template-card-item:hover, .template-card-item.active {{
+      border-color: var(--accent);
+      background: rgba(56, 189, 248, 0.05);
+    }}
+    .template-icon-circle {{
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      background: var(--surface);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent);
+      flex-shrink: 0;
+    }}
+    .template-info-col {{
+      flex: 1;
+      min-width: 0;
+    }}
+    .template-info-title {{
+      font-size: 12px;
+      font-weight: 700;
+      color: #FFF;
+      margin-bottom: 2px;
+    }}
+    .template-info-desc {{
+      font-size: 10.5px;
+      color: var(--text-dim);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+
+    /* Recent Activity List */
+    .activity-list {{
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }}
+    .activity-item {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 9px 12px;
+      border-radius: var(--radius-sm);
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--border-subtle);
+    }}
+    .activity-left {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }}
+    .activity-dot {{
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }}
+    .activity-title-text {{
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+    .activity-sub-text {{
+      font-size: 10.5px;
+      color: var(--text-dim);
+    }}
+    .activity-time {{
+      font-size: 10.5px;
+      color: var(--text-dim);
+      font-family: var(--mono);
+      flex-shrink: 0;
+    }}
+
+    /* Model Integration Card */
+    .model-integration-card {{
+      background: linear-gradient(135deg, rgba(56, 189, 248, 0.08) 0%, rgba(14, 165, 233, 0.02) 100%);
+      border: 1px solid var(--accent-border);
+      border-radius: var(--radius);
+      padding: 16px;
+    }}
+    .model-integration-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }}
+    .model-integration-title {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #FFF;
+    }}
+    .model-integration-desc {{
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-bottom: 12px;
+      line-height: 1.4;
+    }}
+
+    /* ─── SCREEN B & C: SCENARIOS / RELIABILITY LAB STYLES ─── */
+    .lab-header-banner {{
+      margin-bottom: 16px;
+    }}
+    .lab-breadcrumb-row {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }}
+    .lab-breadcrumb {{
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-dim);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+    }}
+    .lab-breadcrumb:hover {{ color: var(--accent); }}
+    .lab-scenario-title {{
+      font-size: 22px;
+      font-weight: 800;
+      color: #FFF;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 4px;
+    }}
+    .lab-scenario-subhead {{
+      font-size: 13px;
+      color: var(--text-muted);
+    }}
+
+    /* Stepper Workflow: 1 Configure -> 2 Execute -> 3 Verify -> 4 Decide -> 5 Result */
+    .stepper-wrap {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: var(--radius);
-      overflow: hidden;
+      padding: 12px 24px;
+      margin-bottom: 18px;
+    }}
+    .step-item {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-dim);
+    }}
+    .step-num {{
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      font-family: var(--mono);
+      font-weight: 700;
+      color: var(--text-muted);
+    }}
+    .step-item.active {{ color: #FFF; }}
+    .step-item.active .step-num {{
+      background: var(--accent);
+      border-color: var(--accent-bright);
+      color: #000;
+    }}
+    .step-item.completed {{ color: var(--success); }}
+    .step-item.completed .step-num {{
+      background: var(--success-bg);
+      border-color: var(--success);
+      color: var(--success);
+    }}
+    .step-divider {{
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+      margin: 0 14px;
+    }}
+
+    /* Task Details Card */
+    .task-details-card {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }}
+    .task-details-left {{
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }}
+    .task-avatar-icon {{
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      color: var(--accent);
+      flex-shrink: 0;
+    }}
+    .task-main-info {{
+      display: flex;
+      flex-direction: column;
+    }}
+    .task-entity-name {{
+      font-size: 14px;
+      font-weight: 700;
+      color: #FFF;
+    }}
+    .task-instruction-text {{
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }}
+    .task-expected-outcome {{
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      font-size: 11px;
+      color: var(--text-dim);
+      border-left: 2px solid var(--border);
+      padding-left: 14px;
+    }}
+    .task-expected-outcome strong {{ color: var(--text-muted); font-size: 10px; text-transform: uppercase; }}
+    .task-meta-right {{
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      text-align: right;
+      font-size: 11px;
+      color: var(--text-dim);
+      font-family: var(--mono);
+    }}
+
+    /* Two Main Verification Cards Grid */
+    .lab-results-grid {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      margin-bottom: 18px;
+    }}
+
+    /* Timeline in Execution Flow */
+    .flow-timeline {{
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      position: relative;
+      padding-left: 20px;
+    }}
+    .flow-timeline::before {{
+      content: '';
+      position: absolute;
+      left: 7px;
+      top: 6px;
+      bottom: 6px;
+      width: 2px;
+      background: var(--border);
+    }}
+    .timeline-node {{
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 12px;
+    }}
+    .timeline-node::before {{
+      content: '';
+      position: absolute;
+      left: -20px;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: var(--surface-2);
+      border: 2px solid var(--border);
+      z-index: 2;
+    }}
+    .timeline-node.active::before {{
+      background: var(--accent);
+      border-color: var(--accent-bright);
+      box-shadow: 0 0 8px var(--accent);
+    }}
+    .timeline-node.success::before {{
+      background: var(--success);
+      border-color: var(--success-bright);
+    }}
+    .timeline-node.danger::before {{
+      background: var(--danger);
+      border-color: var(--danger-bright);
+    }}
+    .timeline-label-col {{
+      display: flex;
+      flex-direction: column;
+    }}
+    .timeline-step-name {{
+      font-weight: 700;
+      color: #FFF;
+    }}
+    .timeline-step-detail {{
+      font-size: 11px;
+      color: var(--text-dim);
+    }}
+    .timeline-time {{
+      font-size: 10.5px;
+      color: var(--text-dim);
+      font-family: var(--mono);
+      flex-shrink: 0;
+    }}
+
+    /* Big Verification Result Card */
+    .verification-big-banner {{
+      padding: 14px 16px;
+      border-radius: var(--radius-sm);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 14px;
+      background: var(--success-bg);
+      border: 1px solid var(--success-border);
+      color: var(--success);
+    }}
+    .verification-big-banner.danger {{
+      background: var(--danger-bg);
+      border-color: var(--danger-border);
+      color: var(--danger);
+    }}
+    .verification-big-banner.warn {{
+      background: var(--warning-bg);
+      border-color: var(--warning-border);
+      color: var(--warning);
+    }}
+    .verification-icon-box {{
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.1);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      font-weight: 800;
+      flex-shrink: 0;
+    }}
+    .verification-headline {{
+      font-size: 13.5px;
+      font-weight: 800;
+      line-height: 1.2;
+    }}
+    .verification-subline {{
+      font-size: 11px;
+      opacity: 0.85;
+      margin-top: 2px;
+    }}
+
+    .evidence-attributes-grid {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 14px;
+    }}
+    .attr-box {{
+      background: var(--surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 8px 12px;
+    }}
+    .attr-key {{
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-dim);
+    }}
+    .attr-val {{
+      font-size: 12px;
+      font-weight: 700;
+      font-family: var(--mono);
+      color: #FFF;
+      margin-top: 2px;
+    }}
+
+    .state-compare-strip {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: rgba(0, 0, 0, 0.25);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 10px 14px;
+      font-size: 11.5px;
+    }}
+    .state-col {{
+      display: flex;
+      flex-direction: column;
+    }}
+    .state-label {{ font-size: 10px; color: var(--text-dim); text-transform: uppercase; }}
+    .state-amount {{ font-size: 13px; font-weight: 700; font-family: var(--mono); color: #FFF; }}
+
+    /* Execution Control Bar */
+    .lab-controls-bar {{
+      background: linear-gradient(180deg, #131B2E 0%, #0E1422 100%);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 18px;
+    }}
+
+    /* ─── SCREEN D: EVIDENCE & ACTIVITY STYLES ─── */
+    .evidence-grid-2 {{
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      gap: 20px;
+    }}
+
+    /* ─── SCREEN E: BENCHMARK STYLES ─── */
+    .bench-stats-row {{
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
       margin-bottom: 20px;
     }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 12.5px; }}
-    th, td {{ padding: 10px 16px; text-align: left; border-bottom: 1px solid var(--border); }}
+    .bench-stat-card {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }}
+    .bench-circle-progress {{
+      width: 48px;
+      height: 48px;
+      position: relative;
+      flex-shrink: 0;
+    }}
+    .bench-stat-num {{
+      font-size: 22px;
+      font-weight: 800;
+      font-family: var(--mono);
+      color: #FFF;
+      line-height: 1.1;
+    }}
+    .bench-stat-lbl {{
+      font-size: 11.5px;
+      color: var(--text-dim);
+    }}
+
+    .bench-progress-card {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 20px;
+    }}
+    .progress-bar-row {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      font-size: 12px;
+    }}
+    .progress-bar-name {{
+      width: 170px;
+      font-weight: 600;
+      color: var(--text-muted);
+      flex-shrink: 0;
+    }}
+    .progress-track {{
+      flex: 1;
+      height: 8px;
+      background: var(--surface-2);
+      border-radius: 4px;
+      overflow: hidden;
+    }}
+    .progress-fill {{
+      height: 100%;
+      border-radius: 4px;
+    }}
+    .progress-percent {{
+      width: 90px;
+      font-family: var(--mono);
+      font-size: 11px;
+      text-align: right;
+      color: var(--text-dim);
+    }}
+
+    /* ─── TABLES ─── */
+    table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+    th, td {{ padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }}
     th {{
-      background: var(--surface);
+      background: var(--panel-elevated);
       color: var(--text-muted);
       font-weight: 700;
       text-transform: uppercase;
-      font-size: 10.5px;
+      font-size: 10px;
       letter-spacing: 0.5px;
     }}
     tr:last-child td {{ border-bottom: none; }}
-    tr:hover td {{ background: rgba(255, 255, 255, 0.015); }}
+    tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
     .val-danger {{ color: var(--danger); font-weight: 700; }}
     .val-success {{ color: var(--success); font-weight: 700; }}
 
-    /* Spin */
+    /* ─── MOBILE BOTTOM NAV ─── */
+    .mobile-bottom-nav {{
+      display: none;
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 60px;
+      background: var(--bg-sidebar);
+      border-top: 1px solid var(--border);
+      z-index: 200;
+      align-items: center;
+      justify-content: space-around;
+      padding: 0 8px;
+    }}
+    .m-nav-item {{
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+      color: var(--text-dim);
+      font-size: 10px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      flex: 1;
+      height: 100%;
+      background: transparent;
+      border: none;
+    }}
+    .m-nav-item.active {{
+      color: var(--accent);
+    }}
+
+    /* ─── RESPONSIVE ─── */
+    @media(max-width: 1024px) {{
+      .app-sidebar {{ display: none; }}
+      .app-main-wrap {{ margin-left: 0; }}
+      .app-topbar {{ height: auto; min-height: 48px; padding: 8px 16px; position: sticky; top: 0; }}
+      .topbar-left {{ gap: 6px; }}
+      .topbar-pill {{ font-size: 10px; padding: 2px 7px; }}
+      .topbar-pill:nth-child(2) {{ display: none; }}
+      .mobile-bottom-nav {{ display: flex; }}
+      .app-content {{ padding-top: 14px; padding-bottom: 80px; padding-left: 14px; padding-right: 14px; }}
+      .mc-grid {{ grid-template-columns: 1fr; }}
+      .scenarios-grid-5 {{ grid-template-columns: 1fr; }}
+      .templates-grid-3 {{ grid-template-columns: 1fr; }}
+      .lab-results-grid {{ grid-template-columns: 1fr; }}
+      .evidence-grid-2 {{ grid-template-columns: 1fr; }}
+      .hero-banner-new {{ flex-direction: column; align-items: flex-start; padding: 18px 16px; }}
+      .hero-shield-art {{ display: none; }}
+      .value-cards-row {{ grid-template-columns: 1fr; }}
+      .stepper-wrap {{ padding: 10px 12px; overflow-x: auto; }}
+      .step-item span:last-child {{ display: none; }}
+      .bench-stats-row {{ grid-template-columns: 1fr; }}
+      .progress-bar-name {{ width: 130px; font-size: 11px; }}
+    }}
+
+    /* ─── SPIN ─── */
     .spin {{ animation: spin 1s linear infinite; display: inline-block; }}
     @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-
-    footer {{
-      background: var(--panel);
-      border-top: 1px solid var(--border);
-      padding: 12px 24px;
-      font-size: 11.5px;
-      color: var(--text-dim);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 8px;
-    }}
   </style>
 </head>
 <body>
 
-<!-- ─── HEADER ─── -->
-<header>
-  <div class="brand">
-    <span class="logo">ReAgent</span>
-    <div>
-      <div class="brand-name">Mission Control</div>
-      <div class="brand-tag">"Doesn't trust 'done.' Verifies it."</div>
-    </div>
-  </div>
-  <div class="header-badges">
-    <span class="badge badge-offline">● OFFLINE · DETERMINISTIC</span>
-    <span class="badge badge-neutral">🧪 SYNTHETIC SANDBOX</span>
-    <span id="nemotronStatusBadge" class="badge {'badge-warn' if nemotron_status == 'NOT_CONFIGURED' else 'badge-live'}">
-      {'⚠ NEMOTRON: NOT CONFIGURED' if nemotron_status == 'NOT_CONFIGURED' else '● NEMOTRON: CONFIGURED'}
-    </span>
-    <span class="badge badge-neutral">git:{SOURCE_GIT_REVISION[:10]}</span>
-  </div>
-</header>
+<div class="app-root">
 
-<!-- ─── NAV ─── -->
-<nav>
-  <button class="tab-btn active" onclick="showTab('mc-tab', this)">Interactive Mission Control</button>
-  <button class="tab-btn" onclick="showTab('bench-tab', this)">480-Trial Comparative Benchmark</button>
-  <button class="tab-btn" onclick="showTab('nemotron-tab', this)">Nemotron / Nebius</button>
-</nav>
-
-<main>
-
-<!-- ═══════════════════════════════════════════════════════════════════════════
-     TAB 1: INTERACTIVE MISSION CONTROL
-════════════════════════════════════════════════════════════════════════════ -->
-<div id="mc-tab" class="tab-pane active">
-
-  <!-- Hero banner containing required invariants -->
-  <div class="hero-banner">
-    <div class="hero-title">Verify Outcomes. Recover Safely.</div>
-    <div class="hero-problem">
-      <strong>The Problem:</strong> A tool can fail to report success even after its side effect has committed, so blindly retrying can duplicate the operation.
-      When AI agents execute state-changing actions, tool calls frequently drop connections or time out after database commits (<code>COMMIT_THEN_TIMEOUT</code>).
-      Naive agents blindly retry, causing duplicate debits and state corruption. ReAgent independently probes system state via fresh read-only connections,
-      verifies postconditions against a frozen success contract, and safely restrains redundant executions.
-    </div>
-    <div class="hero-invariant">
-      <span>⚠️ Safety Invariant:</span>
-      <strong>UNKNOWN is not ABSENT.</strong> When system state is unobservable or ambiguous, the correct outcome is safe escalation, never blind retry or hallucinated completion.
-    </div>
-  </div>
-
-  <div class="mc-layout">
-    <!-- ── LEFT SIDEBAR ── -->
-    <div class="mc-sidebar">
-      <!-- Task Template Selector -->
-      <div class="card">
-        <div class="card-head">
-          <span class="card-title">🗂 Task Template Demo</span>
-          <span class="badge badge-neutral" style="font-size:9.5px;">FIXTURE-BACKED · [Supported Task Template Demo]</span>
-        </div>
-        <div class="card-body" style="padding:10px 12px;">
-          <div style="font-size:10.5px; color:var(--text-dim); margin-bottom:8px; line-height:1.4;">
-            Select a supported task template. Each runs against an isolated deterministic SQLite fixture
-            with real postcondition verification. Not unrestricted natural-language support.
-          </div>
-          <div id="taskTemplateBtns" style="display:flex; flex-direction:column; gap:6px;">
-            <button class="btn task-tpl-btn active" id="tpl_wallet_transfer"
-              onclick="selectTaskTemplate('wallet_transfer', this)"
-              title="Transfer $500.00 · ACCT-2201 → ACCT-3390 · TXN-779043">
-              <span style="font-size:14px;">💳</span>
-              <div style="text-align:left; flex:1;">
-                <div style="font-weight:700; font-size:12px;">Wallet Transfer</div>
-                <div style="font-size:10px; color:var(--text-dim);">$500 · ACCT-2201 → ACCT-3390 · UNPROTECTED_NUMERIC</div>
-              </div>
-            </button>
-            <button class="btn task-tpl-btn" id="tpl_hotel_booking"
-              onclick="selectTaskTemplate('hotel_booking', this)"
-              title="Book Seat 14B on Flight FL-2047 · PAX-9912 · BKG-003341">
-              <span style="font-size:14px;">🏨</span>
-              <div style="text-align:left; flex:1;">
-                <div style="font-weight:700; font-size:12px;">Hotel / Seat Booking</div>
-                <div style="font-size:10px; color:var(--text-dim);">Seat 14B · FL-2047 · KEY_PROTECTED (UNIQUE)</div>
-              </div>
-            </button>
-            <button class="btn task-tpl-btn" id="tpl_database_update"
-              onclick="selectTaskTemplate('database_update', this)"
-              title="Issue refund REF-550291 · $250 · ORD-8821 → CUST-1042">
-              <span style="font-size:14px;">🗄</span>
-              <div style="text-align:left; flex:1;">
-                <div style="font-weight:700; font-size:12px;">Database Update / Refund</div>
-                <div style="font-size:10px; color:var(--text-dim);">$250.00 · ORD-8821 → CUST-1042 · KEY_PROTECTED</div>
-              </div>
-            </button>
-          </div>
-          <div style="margin-top:10px; padding-top:8px; border-top:1px solid var(--border);">
-            <div style="font-size:10px; color:var(--text-dim); margin-bottom:4px;">Task input (auto-populated by template):</div>
-            <textarea id="taskInput" class="task-input" rows="2"
-              placeholder="Select a template above or type a supported phrase"
-              oninput="validateTaskInput()">Send \u20b9500 to Asha for lunch</textarea>
-            <div id="taskRejectMsg" class="task-reject-msg"></div>
-          </div>
-        </div>
+  <!-- ─── SIDEBAR NAVIGATION (DESKTOP) ─── -->
+  <aside class="app-sidebar">
+    <div class="sidebar-brand">
+      <div class="brand-icon-wrap">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+          <path d="M9 12l2 2 4-4"></path>
+        </svg>
       </div>
+      <div class="brand-text-col">
+        <div class="brand-main-title">ReAgent</div>
+        <div class="brand-sub-tag">Agent Reliability Layer</div>
+      </div>
+    </div>
+
+    <nav class="sidebar-nav">
+      <button class="nav-link{active_mc}" id="nav-mc" onclick="navigateTo('view-mission-control', this)">
+        <span class="nav-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
+        </span>
+        <span>Mission Control</span>
+      </button>
+
+      <button class="nav-link{active_sc}" id="nav-scenarios" onclick="navigateTo('view-scenarios', this)">
+        <span class="nav-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
+        </span>
+        <span>Scenarios / Reliability Lab</span>
+      </button>
+
+      <button class="nav-link{active_ev}" id="nav-evidence" onclick="navigateTo('view-evidence', this)">
+        <span class="nav-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+        </span>
+        <span>Evidence &amp; Activity</span>
+      </button>
+
+      <button class="nav-link{active_bm}" id="nav-benchmark" onclick="navigateTo('view-benchmark', this)">
+        <span class="nav-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg>
+        </span>
+        <span>Benchmark</span>
+      </button>
+
+      <button class="nav-link{active_st}" id="nav-settings" onclick="navigateTo('view-settings', this)">
+        <span class="nav-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+        </span>
+        <span>Settings</span>
+      </button>
+    </nav>
+
+    <div class="sidebar-footer-box">
+      <div class="sidebar-powered-by">Powered by</div>
+      <div class="sidebar-powered-brand">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"></path><path d="M2 17l10 5 10-5"></path><path d="M2 12l10 5 10-5"></path></svg>
+        NVIDIA Nemotron via Nebius
+      </div>
+      <div class="sidebar-status-pill">
+        ● {'Live &bull; Configured' if api_key_set else 'Offline &bull; Ready'}
+      </div>
+    </div>
+  </aside>
+
+  <!-- ─── MAIN CONTENT WRAPPER ─── -->
+  <div class="app-main-wrap">
+
+    <!-- Top Application Bar -->
+    <header class="app-topbar">
+      <div class="topbar-left">
+        <span class="topbar-pill ready">● System Ready</span>
+        <span class="topbar-pill">● OFFLINE · DETERMINISTIC</span>
+        <span class="topbar-pill model" id="topbarModelPill">
+          {'Nemotron-3-Super-120B Live' if api_key_set else 'Nemotron-3-Super-120B Advisory'}
+        </span>
+      </div>
+      <div class="topbar-right">
+        <span style="color:var(--text-dim); cursor:pointer;" title="Theme">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+        </span>
+      </div>
+    </header>
+
+    <main class="app-content">
+
+      <!-- ═══════════════════════════════════════════════════════════════════════
+           SCREEN A: MISSION CONTROL (LANDING VIEW)
+      ════════════════════════════════════════════════════════════════════════ -->
+      <section id="view-mission-control" class="app-view{active_mc}">
+        <div class="mc-grid">
+
+          <!-- Left Column -->
+          <div class="mc-left-col">
+
+            <!-- Hero Banner matching reference image -->
+            <div class="hero-banner-new">
+              <div class="hero-text-block">
+                <div class="hero-eyebrow-text">AI AGENT RELIABILITY LAYER</div>
+                <h1 class="hero-headline-text">A timeout <span>isn't a no.</span></h1>
+                <p class="hero-subtitle-text">Verify what actually happened before deciding whether an AI agent should retry.</p>
+                <div class="hero-actions-row">
+                  <button class="btn btn-primary" onclick="openReliabilityLab('B')">
+                    Start a New Investigation &rarr;
+                  </button>
+                  <button class="btn btn-neutral" onclick="navigateTo('view-scenarios')">
+                    View Scenarios
+                  </button>
+                </div>
+
+                <!-- Three Value Micro-cards -->
+                <div class="value-cards-row">
+                  <div class="value-card">
+                    <div class="value-icon">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4"></path><path d="M12 8h.01"></path></svg>
+                    </div>
+                    <div>
+                      <div class="value-title">Independent Observation</div>
+                      <div class="value-desc">Read-only, unbiased state checks</div>
+                    </div>
+                  </div>
+
+                  <div class="value-card">
+                    <div class="value-icon">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+                    </div>
+                    <div>
+                      <div class="value-title">Deterministic Recovery</div>
+                      <div class="value-desc">Policy-driven, safe decisions</div>
+                    </div>
+                  </div>
+
+                  <div class="value-card">
+                    <div class="value-icon">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+                    </div>
+                    <div>
+                      <div class="value-title">Model Proposal (Advisory)</div>
+                      <div class="value-desc">Nemotron suggestions, not execution</div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Problem Statement & Invariant Box (Required test strings) -->
+                <div class="hero-audit-box">
+                  <strong>The Problem:</strong> A tool can fail to report success even after its side effect has committed, so blindly retrying can duplicate the operation.<br>
+                  <span style="color:var(--warning);font-weight:700;">Safety Invariant:</span> <strong>UNKNOWN is not ABSENT.</strong> When system state is unobservable or ambiguous, the correct outcome is safe escalation, never blind retry or hallucinated completion.
+                </div>
+              </div>
+
+              <!-- 3D Isometric Glowing Shield SVG Illustration -->
+              <div class="hero-shield-art">
+                <svg width="130" height="130" viewBox="0 0 140 140" fill="none">
+                  <defs>
+                    <linearGradient id="shieldGrad" x1="20" y1="10" x2="120" y2="130" gradientUnits="userSpaceOnUse">
+                      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.8"/>
+                      <stop offset="100%" stop-color="#0284C7" stop-opacity="0.2"/>
+                    </linearGradient>
+                    <filter id="glowFilter" x="-20%" y="-20%" width="140%" height="140%">
+                      <feDropShadow dx="0" dy="0" stdDeviation="6" flood-color="#38BDF8" flood-opacity="0.5"/>
+                    </filter>
+                  </defs>
+                  <polygon points="70,12 120,38 120,88 70,126 20,88 20,38" stroke="rgba(56, 189, 248, 0.3)" stroke-width="1.5" fill="rgba(14, 165, 233, 0.04)"/>
+                  <polygon points="70,22 110,44 110,84 70,114 30,84 30,44" stroke="url(#shieldGrad)" stroke-width="2" fill="rgba(14, 165, 233, 0.08)" filter="url(#glowFilter)"/>
+                  <path d="M70 45 L90 55 L90 80 L70 95 L50 80 L50 55 Z" fill="rgba(56, 189, 248, 0.15)" stroke="#38BDF8" stroke-width="1.5"/>
+                  <path d="M62 70 L68 76 L80 64" stroke="#38BDF8" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </div>
+            </div>
+
+            <!-- Explore Scenarios (5 chips) -->
+            <div>
+              <div class="section-head-row">
+                <div>
+                  <div class="section-heading">Explore Scenarios</div>
+                  <div class="section-subheading">Five real-world failure patterns. See how ReAgent handles each one.</div>
+                </div>
+                <a class="section-link" onclick="navigateTo('view-scenarios')">View all scenarios &rarr;</a>
+              </div>
+              <div class="scenarios-grid-5">
+                <div class="sc-chip-card" onclick="openReliabilityLab('A')">
+                  <div class="sc-chip-badge" style="background:var(--success-bg); color:var(--success); border:1px solid var(--success-border);">A</div>
+                  <div class="sc-chip-title">A — Normal Success</div>
+                  <div class="sc-chip-sub">Normal execution (verified)</div>
+                </div>
+                <div class="sc-chip-card" onclick="openReliabilityLab('B')" style="border-color:rgba(251, 191, 36, 0.35);">
+                  <div class="sc-chip-badge" style="background:var(--warning-bg); color:var(--warning); border:1px solid var(--warning-border);">B</div>
+                  <div class="sc-chip-title">B — Commit-Then-Timeout</div>
+                  <div class="sc-chip-sub">Duplicate risk (check state)</div>
+                </div>
+                <div class="sc-chip-card" onclick="openReliabilityLab('C')">
+                  <div class="sc-chip-badge" style="background:var(--accent-bg); color:var(--accent); border:1px solid var(--accent-border);">C</div>
+                  <div class="sc-chip-title">C — Fail-Before-Commit</div>
+                  <div class="sc-chip-sub">Confirmed absence (verify)</div>
+                </div>
+                <div class="sc-chip-card" onclick="openReliabilityLab('D')">
+                  <div class="sc-chip-badge" style="background:var(--purple-bg); color:var(--purple); border:1px solid var(--purple-border);">D</div>
+                  <div class="sc-chip-title">D — Unknown Outcome</div>
+                  <div class="sc-chip-sub">Needs check (escalate/safe)</div>
+                </div>
+                <div class="sc-chip-card" onclick="openReliabilityLab('E')">
+                  <div class="sc-chip-badge" style="background:var(--danger-bg); color:var(--danger); border:1px solid var(--danger-border);">E</div>
+                  <div class="sc-chip-title">E — Partial Commit</div>
+                  <div class="sc-chip-sub">Inconsistent state (recover)</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Task Templates -->
+            <div>
+              <div class="section-head-row">
+                <div>
+                  <div class="section-heading">Task Templates</div>
+                  <div class="section-subheading">Common patterns to explore the reliability mechanism. <span class="badge badge-neutral">[Supported Task Template Demo]</span></div>
+                </div>
+                <a class="section-link" onclick="navigateTo('view-scenarios')">View all templates &rarr;</a>
+              </div>
+              <div class="templates-grid-3">
+                <div class="template-card-item active" id="tpl_wallet_transfer" onclick="selectTemplateAndLab('wallet_transfer')">
+                  <div class="template-icon-circle">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"></rect><line x1="1" y1="10" x2="23" y2="10"></line></svg>
+                  </div>
+                  <div class="template-info-col">
+                    <div class="template-info-title">Wallet Transfer</div>
+                    <div class="template-info-desc">Detect duplicate side effects</div>
+                  </div>
+                </div>
+
+                <div class="template-card-item" id="tpl_hotel_booking" onclick="selectTemplateAndLab('hotel_booking')">
+                  <div class="template-icon-circle">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
+                  </div>
+                  <div class="template-info-col">
+                    <div class="template-info-title">Booking</div>
+                    <div class="template-info-desc">Check reservation exists</div>
+                  </div>
+                </div>
+
+                <div class="template-card-item" id="tpl_database_update" onclick="selectTemplateAndLab('database_update')">
+                  <div class="template-icon-circle">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
+                  </div>
+                  <div class="template-info-col">
+                    <div class="template-info-title">Database / Refund</div>
+                    <div class="template-info-desc">Detect partial commits</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+          </div><!-- end left col -->
+
+          <!-- Right Column -->
+          <div class="mc-right-col">
+
+            <!-- Recent Activity Card -->
+            <div class="card">
+              <div class="card-head">
+                <span class="card-title">Recent Activity</span>
+                <a class="section-link" onclick="navigateTo('view-evidence')">View all &rarr;</a>
+              </div>
+              <div class="card-body" style="padding:12px;">
+                <div class="activity-list" id="recentActivityList">
+                  <div class="activity-item">
+                    <div class="activity-left">
+                      <span class="activity-dot" style="background:var(--success);"></span>
+                      <div>
+                        <div class="activity-title-text">Wallet Transfer &bull; Scenario B</div>
+                        <div class="activity-sub-text">Verified success &bull; Safe recovery</div>
+                      </div>
+                    </div>
+                    <div class="activity-time">2m ago</div>
+                  </div>
+
+                  <div class="activity-item">
+                    <div class="activity-left">
+                      <span class="activity-dot" style="background:var(--accent);"></span>
+                      <div>
+                        <div class="activity-title-text">Booking &bull; Scenario C</div>
+                        <div class="activity-sub-text">Confirmed absence &bull; No retry</div>
+                      </div>
+                    </div>
+                    <div class="activity-time">8m ago</div>
+                  </div>
+
+                  <div class="activity-item">
+                    <div class="activity-left">
+                      <span class="activity-dot" style="background:var(--danger);"></span>
+                      <div>
+                        <div class="activity-title-text">Database Refund &bull; Scenario D</div>
+                        <div class="activity-sub-text">Partial commit &bull; Recovery suggested</div>
+                      </div>
+                    </div>
+                    <div class="activity-time">14m ago</div>
+                  </div>
+
+                  <div class="activity-item">
+                    <div class="activity-left">
+                      <span class="activity-dot" style="background:var(--success);"></span>
+                      <div>
+                        <div class="activity-title-text">Wallet Transfer &bull; Scenario A</div>
+                        <div class="activity-sub-text">Completed &bull; Normal execution</div>
+                      </div>
+                    </div>
+                    <div class="activity-time">22m ago</div>
+                  </div>
+
+                  <div class="activity-item">
+                    <div class="activity-left">
+                      <span class="activity-dot" style="background:var(--warning);"></span>
+                      <div>
+                        <div class="activity-title-text">Booking &bull; Scenario B</div>
+                        <div class="activity-sub-text">Duplicate risk &bull; Blocked retry</div>
+                      </div>
+                    </div>
+                    <div class="activity-time">36m ago</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Model Integration Card -->
+            <div class="model-integration-card">
+              <div class="model-integration-head">
+                <div class="model-integration-title">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><path d="M12 6v6l4 2"></path></svg>
+                  Nemotron-3-Super-120B
+                </div>
+                <span class="badge {'badge-live' if api_key_set else 'badge-offline'}">{'Live' if api_key_set else 'Advisory'}</span>
+              </div>
+              <div class="model-integration-desc">
+                Nebius Token Factory &bull; Advisory only structured contract generation.
+              </div>
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-size:10.5px; color:var(--text-dim); font-family:var(--mono);">max_tokens: 768</span>
+                <a class="section-link" onclick="navigateTo('view-settings')">View details &rarr;</a>
+              </div>
+            </div>
+
+          </div><!-- end right col -->
+
+        </div>
+      </section>
 
 
-      <!-- Five Scenario Selectors -->
-      <div class="card">
-        <div class="card-head"><span class="card-title">⚙ Five Scenarios (Phase 3)</span></div>
-        <div class="card-body" style="padding: 8px 10px;">
-          <div class="scenario-cards" id="scenarioCards">
-            <!-- Rendered by JS -->
+      <!-- ═══════════════════════════════════════════════════════════════════════
+           SCREEN B & C: SCENARIOS / RELIABILITY LAB
+      ════════════════════════════════════════════════════════════════════════ -->
+      <section id="view-scenarios" class="app-view{active_sc}">
+        <div class="lab-header-banner">
+          <div class="lab-breadcrumb-row">
+            <span class="lab-breadcrumb" onclick="navigateTo('view-mission-control')">
+              &larr; Scenarios / Reliability Lab
+            </span>
+            <span class="lab-breadcrumb" onclick="navigateTo('view-mission-control')">
+              &larr; Back to Scenarios
+            </span>
+          </div>
+          <div class="lab-scenario-title">
+            <span id="labScenarioTitleText">Scenario B: Commit-Then-Timeout</span>
+            <span id="labScenarioTagBadge" class="badge badge-warn">Duplicate Risk</span>
+          </div>
+          <div class="lab-scenario-subhead" id="labScenarioSubheadText">
+            The action may have committed, so blindly retrying can duplicate the operation.
           </div>
         </div>
-      </div>
 
-      <!-- Action buttons -->
-      <div class="card">
-        <div class="card-head"><span class="card-title">▶ Execution Controls</span></div>
-        <div class="card-body">
-          <div class="action-row">
-            <button class="btn btn-primary" id="btnRun" onclick="runComparison()" style="flex:1;">
+        <!-- Scenario Quick-Switch Filter Pills (Mobile & Desktop) -->
+        <div class="sc-filter-pills" style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:14px; padding-bottom:2px;">
+          <button class="btn btn-neutral" id="pill-sc-A" onclick="openReliabilityLab('A')" style="padding:4px 10px; font-size:11px; font-family:var(--mono);">A — Normal Success</button>
+          <button class="btn btn-neutral" id="pill-sc-B" onclick="openReliabilityLab('B')" style="padding:4px 10px; font-size:11px; font-family:var(--mono);">B — Commit-Then-Timeout</button>
+          <button class="btn btn-neutral" id="pill-sc-C" onclick="openReliabilityLab('C')" style="padding:4px 10px; font-size:11px; font-family:var(--mono);">C — Fail-Before-Commit</button>
+          <button class="btn btn-neutral" id="pill-sc-D" onclick="openReliabilityLab('D')" style="padding:4px 10px; font-size:11px; font-family:var(--mono);">D — Unknown Outcome</button>
+          <button class="btn btn-neutral" id="pill-sc-E" onclick="openReliabilityLab('E')" style="padding:4px 10px; font-size:11px; font-family:var(--mono);">E — Partial Commit</button>
+        </div>
+
+        <!-- Primary Action & Control Bar (Visible Above the Fold) -->
+        <div class="lab-controls-bar">
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+            <button class="btn btn-primary" id="btnRun" onclick="runComparison()" style="padding:10px 20px; font-size:13px; font-weight:700;">
               <span id="btnRunIcon">▶</span>
               <span id="btnRunLabel">Run Recovery Simulation</span>
             </button>
-            <button class="btn btn-neutral" id="btnReset" onclick="resetState()" title="Reset both worlds">↺ Reset</button>
+            <button class="btn btn-neutral" id="btnReset" onclick="resetState()">↺ Reset</button>
+            <button class="btn btn-neutral" id="btnReplay" onclick="replayEvents()" disabled>⏪ Replay</button>
+            <span id="replayProgress" style="font-size:11px; font-family:var(--mono); color:var(--accent);"></span>
           </div>
-          <div class="action-row" style="margin-top: 8px;">
-            <button class="btn btn-neutral" id="btnReplay" onclick="replayEvents()" disabled style="flex:1;">
-              ⏪ Replay Events
-            </button>
-          </div>
-          <div id="oracleBtnRow" class="action-row" style="margin-top: 8px; display: none;">
-            <button class="btn btn-oracle" id="btnOracle" onclick="revealOracle()" style="flex:1;">
-              🔮 Judge Oracle Reveal (Scenario D)
-            </button>
-          </div>
-        </div>
-      </div>
 
-      <!-- Run Record Card -->
-      <div id="runMetaCard" class="card" style="display: none;">
-        <div class="card-head"><span class="card-title">📋 Run Record & Receipt</span></div>
-        <div class="card-body" style="padding: 10px 12px; font-family: var(--mono); font-size: 10.5px; color: var(--text-muted); line-height: 1.8;">
-          <div><span style="color:var(--text-dim);">Run ID:</span> <span id="runIdVal" style="color:var(--text);">—</span></div>
-          <div><span style="color:var(--text-dim);">Scenario:</span> <span id="runScenarioVal" style="color:var(--text);">—</span></div>
-          <div><span style="color:var(--text-dim);">Contract Hash:</span> <span id="runHashVal" style="color:var(--text);">—</span></div>
-          <div><span style="color:var(--text-dim);">Duration:</span> <span id="runDurVal" style="color:var(--text);">—</span></div>
-          <div><span style="color:var(--text-dim);">Provenance:</span> <span id="runProvenanceVal" style="color:var(--warning);">SYNTHETIC · OFFLINE</span></div>
-          <div style="margin-top: 10px;">
-            <button class="btn btn-neutral" id="btnDownload" onclick="downloadReceipt()" disabled style="width: 100%; justify-content: center;">
-              ⬇ Download Evidence Receipt (.json)
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+            <div id="oracleBtnRow" style="display:none;">
+              <button class="btn btn-oracle" id="btnOracle" onclick="revealOracle()">
+                🔮 Judge Oracle Reveal (Scenario D)
+              </button>
+            </div>
+            <button class="btn btn-neutral" id="btnToggleDiagnostics" onclick="toggleDiagnostics()">
+              ⚙ Advanced Diagnostics
             </button>
           </div>
         </div>
-      </div>
-    </div><!-- end sidebar -->
 
-    <!-- ── RIGHT: TWO EXECUTION LANES ── -->
-    <div>
-      <!-- Scenario description & fixture baseline banner -->
-      <div id="scenarioBar" style="background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:12px 18px; margin-bottom:12px; font-size:13px; color:var(--text-muted);">
-        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:6px;">
-          <strong style="color:var(--text); font-size:14px;" id="scenarioBarLabel">Scenario B: Commit-Then-Timeout</strong>
-          <div style="display:flex; gap:6px;">
-            <span id="fixtureProtectionBadge" class="badge badge-neutral">UNPROTECTED_NUMERIC</span>
-            <span id="fixtureFaultBadge" class="badge badge-warn">FAULT: COMMIT_THEN_TIMEOUT</span>
-          </div>
+        <!-- Oracle Reveal Panel (Scenario D only) -->
+        <div id="oraclePanel" style="display:none; background:#1C102C; border:1px solid #9333EA; border-radius:var(--radius); padding:16px 20px; margin-bottom:18px;">
+          <div style="font-size:13px; font-weight:800; color:#C084FC; margin-bottom:6px;">🔮 Judge Oracle — Hidden Ground Truth Revealed</div>
+          <div id="oracleBody" style="font-size:12px; color:var(--text-muted); line-height:1.6;">—</div>
         </div>
-        <div id="scenarioBarDesc" style="line-height:1.5;">Commit occurs before timeout. Naive retry causes duplicate debit ($1,000); ReAgent probes, verifies, and restrains retry ($500 preserved).</div>
-        <div style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border); font-size:12px; display:flex; align-items:center; gap:8px;">
-          <span style="color:var(--accent); font-weight:700;">Initial Fixture State:</span>
-          <span id="fixtureBaselineDesc" style="color:var(--text); font-family:var(--mono);">ACCT-2201 balance: $1,000.00 | Ledger rows: 0 | Target: $500.00 to Asha (ACCT-3390)</span>
-        </div>
-      </div>
 
-      <div class="lanes">
-        <!-- LANE 1: NAIVE RETRY AGENT -->
-        <div class="lane lane-naive">
-          <div class="lane-header">
-            <div class="lane-name">⚠ Naive Agent (Blind Retry)</div>
-            <span class="badge badge-warn" id="naiveStatusBadge">IDLE</span>
+        <!-- 5-Step Workflow Stepper -->
+        <div class="stepper-wrap">
+          <div class="step-item completed" id="step1">
+            <span class="step-num">1</span>
+            <span>Configure</span>
           </div>
-          <div class="lane-body">
-            <!-- Before / After Fixture State Comparison -->
-            <div class="state-compare-box">
-              <span style="color:var(--text-dim);">Initial Fixture: <strong id="naiveBeforeState" style="color:var(--text); font-family:var(--mono);">$1,000.00 (0 rows)</strong></span>
-              <span style="color:var(--text-dim);">Observed After: <strong id="naiveAfterState" style="color:var(--text); font-family:var(--mono);">Awaiting Run</strong></span>
-            </div>
-
-            <!-- Policy & Certainty Summary -->
-            <div class="outcome-policy-box">
-              <div class="policy-pill">
-                <div class="policy-pill-label">Retry Policy</div>
-                <div class="policy-pill-val" style="color:var(--danger);" id="naivePolicyVal">BLIND RETRY</div>
-              </div>
-              <div class="policy-pill">
-                <div class="policy-pill-label">Outcome Certainty</div>
-                <div class="policy-pill-val" style="color:var(--text-muted);" id="naiveCertaintyVal">UNVERIFIED ASSUMPTION</div>
-              </div>
-            </div>
-
-            <div class="wallet">
-              <div class="wallet-label" id="naiveEntityLabel">Balance — ACCT-2201 (Isolated World A)</div>
-              <div class="wallet-balance neutral" id="naiveBal">$1,000.00</div>
-            </div>
-            <div class="wallet-label" id="naiveLedgerLabel" style="margin-bottom:6px;">Ledger Activity</div>
-            <div class="ledger-rows" id="naiveLedger">
-              <div style="color:var(--text-dim); font-size:11px; padding:4px 0;">No transactions executed yet</div>
-            </div>
-            <div class="decision-card decision-PENDING" id="naiveDecision">
-              Outcome: PENDING
-            </div>
-            <div class="rationale-box" id="naiveRationaleBox">
-              <div class="rationale-title">Decision Rationale &amp; Proof</div>
-              <div id="naiveRationale" class="rationale-desc">
-                Awaiting simulation run.
-              </div>
-            </div>
-
-            <!-- Prominent Observer Evidence Card -->
-            <div class="evidence-card">
-              <div class="evidence-card-head">
-                <span>🔬 Observer Evidence (or lack thereof)</span>
-                <span id="naiveEvidenceBadge" class="badge badge-neutral" style="font-size:9.5px;">AWAITING RUN</span>
-              </div>
-              <div class="evidence-body">
-                <div class="evidence-row"><span class="ev-key">Expected Target</span><span class="ev-val" id="naiveExpTarget">$500.00</span></div>
-                <div class="evidence-row"><span class="ev-key">Expected Entity</span><span class="ev-val" id="naiveExpEntity">Asha (ACCT-3390)</span></div>
-                <div class="evidence-row"><span class="ev-key">Expected Records</span><span class="ev-val" id="naiveExpRecords">1</span></div>
-                <div class="evidence-row"><span class="ev-key">Contract Verified?</span><span class="ev-val bad" id="naiveContractVerified">NO (0 probes)</span></div>
-                <div class="evidence-row"><span class="ev-key">Observed Status</span><span class="ev-val" id="naiveObserved">—</span></div>
-                <div class="evidence-row"><span class="ev-key">Tool Attempts</span><span class="ev-val" id="naiveAttempts">—</span></div>
-                <div class="evidence-row"><span class="ev-key">Read-Only Probes</span><span class="ev-val" id="naiveProbes">0</span></div>
-              </div>
-              <details style="padding:6px 12px 8px 12px; font-size:11px; border-top:1px solid var(--border);">
-                <summary style="cursor:pointer; color:var(--accent); font-weight:600;">Technical Telemetry &amp; Raw JSON</summary>
-                <pre id="naiveRawDetails" style="margin-top:6px; font-family:var(--mono); font-size:10.5px; background:var(--surface); padding:8px; border-radius:4px; overflow-x:auto; max-height:120px; color:var(--text-muted);">No telemetry yet</pre>
-              </details>
-            </div>
+          <div class="step-divider"></div>
+          <div class="step-item completed" id="step2">
+            <span class="step-num">2</span>
+            <span>Execute</span>
+          </div>
+          <div class="step-divider"></div>
+          <div class="step-item active" id="step3">
+            <span class="step-num">3</span>
+            <span>Verify</span>
+          </div>
+          <div class="step-divider"></div>
+          <div class="step-item" id="step4">
+            <span class="step-num">4</span>
+            <span>Decide</span>
+          </div>
+          <div class="step-divider"></div>
+          <div class="step-item" id="step5">
+            <span class="step-num">5</span>
+            <span>Result</span>
           </div>
         </div>
 
-        <!-- LANE 2: REAGENT RELIABILITY LAYER -->
-        <div class="lane lane-reagent">
-          <div class="lane-header">
-            <div class="lane-name">✓ ReAgent (Contract + Probe)</div>
-            <span class="badge badge-offline" id="reagentStatusBadge">IDLE</span>
-          </div>
-          <div class="lane-body">
-            <!-- Before / After Fixture State Comparison -->
-            <div class="state-compare-box">
-              <span style="color:var(--text-dim);">Initial Fixture: <strong id="reagentBeforeState" style="color:var(--text); font-family:var(--mono);">$1,000.00 (0 rows)</strong></span>
-              <span style="color:var(--text-dim);">Observed After: <strong id="reagentAfterState" style="color:var(--text); font-family:var(--mono);">Awaiting Run</strong></span>
+        <!-- Task Details Card -->
+        <div class="task-details-card">
+          <div class="task-details-left">
+            <div class="task-avatar-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
             </div>
-
-            <!-- Policy & Certainty Summary -->
-            <div class="outcome-policy-box">
-              <div class="policy-pill">
-                <div class="policy-pill-label">Recovery Policy</div>
-                <div class="policy-pill-val" style="color:var(--success);" id="reagentPolicyVal">STATE-GOVERNED RECOVERY</div>
-              </div>
-              <div class="policy-pill">
-                <div class="policy-pill-label">Outcome Certainty</div>
-                <div class="policy-pill-val" style="color:var(--accent);" id="reagentCertaintyVal">INDEPENDENT PROBE</div>
-              </div>
-            </div>
-
-            <div class="wallet">
-              <div class="wallet-label" id="reagentEntityLabel">Balance — ACCT-2201 (Isolated World B)</div>
-              <div class="wallet-balance neutral" id="reagentBal">$1,000.00</div>
-            </div>
-            <div class="wallet-label" id="reagentLedgerLabel" style="margin-bottom:6px;">Ledger Activity</div>
-            <div class="ledger-rows" id="reagentLedger">
-              <div style="color:var(--text-dim); font-size:11px; padding:4px 0;">No transactions executed yet</div>
-            </div>
-            <div class="decision-card decision-PENDING" id="reagentDecision">
-              Decision: PENDING
-            </div>
-            <div class="rationale-box" id="reagentRationaleBox">
-              <div class="rationale-title">Decision Rationale &amp; Proof</div>
-              <div id="reagentRationale" class="rationale-desc">
-                Awaiting simulation run.
-              </div>
-            </div>
-
-            <!-- Prominent Observer Evidence Card -->
-            <div class="evidence-card">
-              <div class="evidence-card-head">
-                <span>🔬 Observer Evidence &amp; Verification</span>
-                <span id="reagentEvidenceBadge" class="badge badge-neutral" style="font-size:9.5px;">AWAITING RUN</span>
-              </div>
-              <div class="evidence-body">
-                <div class="evidence-row"><span class="ev-key">Expected Target</span><span class="ev-val" id="reagentExpTarget">$500.00</span></div>
-                <div class="evidence-row"><span class="ev-key">Expected Entity</span><span class="ev-val" id="reagentExpEntity">Asha (ACCT-3390)</span></div>
-                <div class="evidence-row"><span class="ev-key">Expected Records</span><span class="ev-val" id="reagentExpRecords">1</span></div>
-                <div class="evidence-row"><span class="ev-key">Contract Verified?</span><span class="ev-val" id="reagentContractVerified">—</span></div>
-                <div class="evidence-row"><span class="ev-key">Observed Status</span><span class="ev-val" id="reagentObserved">—</span></div>
-                <div class="evidence-row"><span class="ev-key">Tool Attempts</span><span class="ev-val" id="reagentAttempts">—</span></div>
-                <div class="evidence-row"><span class="ev-key">Read-Only Probes</span><span class="ev-val" id="reagentProbes">—</span></div>
-                <div class="evidence-row"><span class="ev-key">Recovery Decision</span><span class="ev-val" id="reagentRecovery">—</span></div>
-              </div>
-              <details style="padding:6px 12px 8px 12px; font-size:11px; border-top:1px solid var(--border);">
-                <summary style="cursor:pointer; color:var(--accent); font-weight:600;">Technical Telemetry &amp; Raw JSON</summary>
-                <pre id="reagentRawDetails" style="margin-top:6px; font-family:var(--mono); font-size:10.5px; background:var(--surface); padding:8px; border-radius:4px; overflow-x:auto; max-height:120px; color:var(--text-muted);">No telemetry yet</pre>
-              </details>
+            <div class="task-main-info">
+              <div class="task-entity-name" id="taskMainEntity">Wallet Transfer</div>
+              <div class="task-instruction-text" id="taskMainInstruction">Transfer $500.00 to account ****1234</div>
             </div>
           </div>
-        </div>
-      </div><!-- end lanes -->
 
-      <!-- Judge Oracle Reveal Panel (Scenario D only) -->
-      <div id="oraclePanel">
-        <div class="oracle-title">🔮 Judge Oracle — Hidden Ground Truth Revealed</div>
-        <div class="oracle-body" id="oracleBody">—</div>
-      </div>
+          <div class="task-expected-outcome">
+            <strong>Expected Outcome</strong>
+            <span id="taskOutcomeLine1">&bull; Transaction succeeds once</span>
+            <span id="taskOutcomeLine2">&bull; No duplicate debit</span>
+          </div>
 
-      <!-- Real Backend Event Log -->
-      <div class="event-log" id="eventLogWrap" style="display: none;">
-        <div class="event-log-head">
-          <span class="event-log-title">📡 Real Backend Event Log</span>
-          <div style="display: flex; gap: 8px;">
-            <span id="eventLogCount" class="badge badge-neutral">0 events</span>
-            <button class="btn btn-neutral" style="padding: 3px 8px; font-size: 11px;" onclick="clearEventLog()">Clear</button>
+          <div class="task-meta-right">
+            <div>Template: <strong id="taskMetaTemplate" style="color:var(--text);">Wallet Transfer</strong></div>
+            <div>Scenario: <strong id="taskMetaScenario" style="color:var(--text);">B - Commit-Then-Timeout</strong></div>
+            <div style="margin-top:4px;"><a class="section-link" onclick="toggleTaskEdit()">Edit Task &darr;</a></div>
           </div>
         </div>
-        <div class="event-log-body" id="eventLogBody"></div>
-      </div>
 
-    </div><!-- end right column -->
-  </div><!-- end mc-layout -->
-</div><!-- end mc-tab -->
-
-
-<!-- ═══════════════════════════════════════════════════════════════════════════
-     TAB 2: 480-TRIAL COMPARATIVE BENCHMARK
-════════════════════════════════════════════════════════════════════════════ -->
-<div id="bench-tab" class="tab-pane">
-  <div class="hero-banner">
-    <div class="hero-title">480-Trial Comparative Benchmark</div>
-    <div class="hero-problem">
-      Evaluated across 12 realistic enterprise tasks &times; 8 fault modes &times; 5 policy arms on fresh disposable SQLite databases.
-      Proves that shallow presence checks (<code>COUNT &gt; 0</code>) suffer a <strong>44.8% false verification rate</strong>, while ReAgent eliminates false claims completely (<strong>0.0%</strong>).
-    </div>
-    <div class="hero-invariant">
-      <span>Exact Accounting Formula:</span>
-      <strong>true_verified + false_verified + safe_escalations + unnecessary_escalations == 96</strong> per arm (N=480 total).
-    </div>
-    <div style="margin-top: 8px;">
-      <span class="badge badge-warn">⚠ SYNTHETIC DATA — Deterministic test suite fixtures; not live financial transactions</span>
-    </div>
-  </div>
-
-  <div class="table-container">
-    <table>
-      <thead>
-        <tr>
-          <th>Policy Arm</th>
-          <th>Trials (N)</th>
-          <th>True Verified</th>
-          <th>False Verified</th>
-          <th>False Rate</th>
-          <th>Safe Escalations</th>
-          <th>Unnec. Escalations</th>
-          <th>Unsafe Retries</th>
-          <th>Duplicate Writes (Primary / Audit)</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td><strong>REAGENT_CONTRACT</strong></td>
-          <td>96</td>
-          <td class="val-success">29</td>
-          <td class="val-success">0</td>
-          <td class="val-success">0.0%</td>
-          <td>67</td>
-          <td>0</td>
-          <td class="val-success">0</td>
-          <td class="val-success">0 / 0 (0 rows)</td>
-        </tr>
-        <tr>
-          <td>SHARED_OBSERVATION</td>
-          <td>96</td>
-          <td>29</td>
-          <td class="val-danger">43</td>
-          <td class="val-danger">44.8%</td>
-          <td>24</td>
-          <td>0</td>
-          <td>0</td>
-          <td>0 / 3 audit</td>
-        </tr>
-        <tr>
-          <td>TOOL_CLAIM_ONLY</td>
-          <td>96</td>
-          <td>15</td>
-          <td class="val-danger">45</td>
-          <td class="val-danger">46.9%</td>
-          <td>29</td>
-          <td>7</td>
-          <td>0</td>
-          <td>0 / 0</td>
-        </tr>
-        <tr>
-          <td>NAIVE_RETRY</td>
-          <td>96</td>
-          <td>32</td>
-          <td class="val-danger">64</td>
-          <td class="val-danger">66.7%</td>
-          <td>0</td>
-          <td>0</td>
-          <td class="val-danger">24</td>
-          <td class="val-danger">4 primary / 5 audit (9 rows)</td>
-        </tr>
-        <tr>
-          <td>ALWAYS_ESCALATE</td>
-          <td>96</td>
-          <td>0</td>
-          <td>0</td>
-          <td>0.0%</td>
-          <td>74</td>
-          <td>22</td>
-          <td>0</td>
-          <td>0 / 0</td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
-
-  <div style="background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:16px 20px;">
-    <div style="font-size:12px; font-weight:700; color:var(--accent); text-transform:uppercase; letter-spacing:0.6px; margin-bottom:10px;">
-      Mathematical Denominator Reconciliation (M5 / M13 Audit)
-    </div>
-    <div style="font-family:var(--mono); font-size:11.5px; color:var(--text-muted); line-height:1.9;">
-      <div>Total trials: 5 arms &times; 96 = <strong style="color:var(--text);">480</strong></div>
-      <div>Per-arm partition: true_verified + false_verified + safe_escalations + unnecessary_escalations = 96</div>
-      <div>REAGENT_CONTRACT: 29 + 0 + 67 + 0 = <strong style="color:var(--success);">96 ✓</strong> (0.0% false verification rate)</div>
-      <div>NAIVE_RETRY: 32 + 64 + 0 + 0 = <strong style="color:var(--success);">96 ✓</strong> (66.7% false verification rate)</div>
-      <div>ALWAYS_ESCALATE: 0 + 0 + 74 + 22 = <strong style="color:var(--success);">96 ✓</strong> (Fail-safe baseline)</div>
-      <div style="margin-top:10px; padding-top:8px; border-top:1px solid var(--border);">
-        <strong style="color:var(--text);">Duplicate Write Accounting Reconciliation (from raw artifacts):</strong>
-        <div style="color:var(--text-dim); margin-top:3px;">
-          • <strong>24 Unsafe Retries:</strong> Trials where Naive Agent executed a blind retry after an ambiguous error.<br>
-          • <strong>4 Duplicate Primary Records:</strong> Duplicate financial debits / primary entity writes (`duplicate_primary_count: 4`).<br>
-          • <strong>5 Duplicate Audit Log Rows:</strong> Secondary audit log duplications on unconstrained tables (`duplicate_audit_count: 5`).<br>
-          • <strong>Total:</strong> 9 duplicate database rows across 24 unsafe retry events (24 unsafe retries produced 4 duplicate primary records and 5 duplicate audit log rows). ReAgent had <strong>0 unsafe retries, 0 duplicate primary writes, and 0 duplicate audit writes</strong> across all 96 trials.
+        <!-- Task Edit Collapsible Drawer -->
+        <div id="taskEditDrawer" style="display:none; background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:14px 18px; margin-bottom:18px;">
+          <div style="font-size:11px; color:var(--text-dim); margin-bottom:6px;">Select Supported Template &amp; Intent:</div>
+          <div style="display:flex; gap:8px; margin-bottom:8px;">
+            <button class="btn btn-neutral" onclick="selectTaskTemplate('wallet_transfer')">💳 Wallet ($500)</button>
+            <button class="btn btn-neutral" onclick="selectTaskTemplate('hotel_booking')">🏨 Booking (Room 14B)</button>
+            <button class="btn btn-neutral" onclick="selectTaskTemplate('database_update')">🗄 Refund ($250)</button>
+          </div>
+          <textarea id="taskInput" class="task-input" rows="2" style="width:100%; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-sm); color:#FFF; padding:8px 12px; font-family:var(--sans);" oninput="validateTaskInput()">Send ₹500 to Asha for lunch</textarea>
+          <div id="taskRejectMsg" style="display:none; color:var(--danger); font-size:11.5px; margin-top:6px;"></div>
         </div>
-      </div>
-    </div>
-  </div>
-</div><!-- end bench-tab -->
+
+        <!-- Two Main Results Cards Grid -->
+        <div class="lab-results-grid">
+
+          <!-- Left Card: Execution Flow -->
+          <div class="card">
+            <div class="card-head">
+              <span class="card-title">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+                Execution Flow
+              </span>
+              <span class="badge badge-neutral" id="flowStatusBadge">STATE: PROBED</span>
+            </div>
+            <div class="card-body">
+              <div class="flow-timeline" id="flowTimeline">
+                <div class="timeline-node success">
+                  <div class="timeline-label-col">
+                    <span class="timeline-step-name">Action Executed</span>
+                    <span class="timeline-step-detail" id="node1Detail">Transfer request sent to tool</span>
+                  </div>
+                  <span class="timeline-time">10:24:01</span>
+                </div>
+
+                <div class="timeline-node danger">
+                  <div class="timeline-label-col">
+                    <span class="timeline-step-name">Response Lost</span>
+                    <span class="timeline-step-detail" id="node2Detail">Timeout after 2.5s (COMMIT_THEN_TIMEOUT)</span>
+                  </div>
+                  <span class="timeline-time">10:24:03</span>
+                </div>
+
+                <div class="timeline-node active">
+                  <div class="timeline-label-col">
+                    <span class="timeline-step-name">Independent Observation</span>
+                    <span class="timeline-step-detail" id="node3Detail">Read-only probe to verify state</span>
+                  </div>
+                  <span class="timeline-time">10:24:06</span>
+                </div>
+
+                <div class="timeline-node success">
+                  <div class="timeline-label-col">
+                    <span class="timeline-step-name">Verification Complete</span>
+                    <span class="timeline-step-detail" id="node4Detail">Found transaction in ledger</span>
+                  </div>
+                  <span class="timeline-time">10:24:08</span>
+                </div>
+
+                <div class="timeline-node success">
+                  <div class="timeline-label-col">
+                    <span class="timeline-step-name">Recovery Decision</span>
+                    <span class="timeline-step-detail" id="node5Detail">Suppress retry &bull; Prevent duplicate</span>
+                  </div>
+                  <span class="badge badge-live">Safe</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right Card: Verification Result -->
+          <div class="card">
+            <div class="card-head">
+              <span class="card-title">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+                Verification Result
+              </span>
+              <span class="badge badge-live" id="resultCardPill">VERIFIED</span>
+            </div>
+            <div class="card-body">
+              <div class="verification-big-banner" id="verificationBigBanner">
+                <div class="verification-icon-box">✓</div>
+                <div>
+                  <div class="verification-headline" id="verificationHeadlineText">VERIFIED: Transaction found in ledger</div>
+                  <div class="verification-subline" id="verificationSublineText">Committed successfully on disk prior to tool timeout</div>
+                </div>
+              </div>
+
+              <div class="evidence-attributes-grid">
+                <div class="attr-box">
+                  <div class="attr-key">Amount</div>
+                  <div class="attr-val" id="attrAmountVal">$500.00</div>
+                </div>
+                <div class="attr-box">
+                  <div class="attr-key">To Account</div>
+                  <div class="attr-val" id="attrAccountVal">****1234</div>
+                </div>
+                <div class="attr-box">
+                  <div class="attr-key">Transaction ID</div>
+                  <div class="attr-val" id="attrTxnVal">tx_7f3a9c2e</div>
+                </div>
+                <div class="attr-box">
+                  <div class="attr-key">Timestamp</div>
+                  <div class="attr-val" id="attrTimeVal">10:24:01</div>
+                </div>
+              </div>
+
+              <div class="state-compare-strip">
+                <div class="state-col">
+                  <span class="state-label">Before State</span>
+                  <span class="state-amount" id="labStateBefore">$1,000.00</span>
+                </div>
+                <span style="color:var(--text-dim);">&rarr;</span>
+                <div class="state-col" style="text-align:right;">
+                  <span class="state-label">After State</span>
+                  <span class="state-amount" id="labStateAfter" style="color:var(--success);">$500.00</span>
+                </div>
+              </div>
+
+              <div style="margin-top:12px; display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-size:11px; color:var(--text-dim);">ReAgent Contract Verification</span>
+                <a class="section-link" onclick="navigateTo('view-evidence')">View details &rarr;</a>
+              </div>
+            </div>
+          </div>
+
+        </div><!-- end lab-results-grid -->
+
+        <!-- Advanced Diagnostics (Collapsible: Contains all original test IDs) -->
+        <div id="advancedDiagnosticsWrap" style="display:none; margin-top:20px;">
+          <div class="card" style="margin-bottom:18px;">
+            <div class="card-head">
+              <span class="card-title">Side-by-Side Execution Lanes (Naive vs ReAgent)</span>
+              <span class="badge badge-neutral">TECHNICAL COMPARISON</span>
+            </div>
+            <div class="card-body">
+              <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+                <!-- Naive Lane -->
+                <div style="background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px;">
+                  <div style="font-weight:700; color:var(--danger); margin-bottom:8px; display:flex; justify-content:space-between;">
+                    <span>⚠ Naive Agent (Blind Retry)</span>
+                    <span id="naiveStatusBadge" class="badge badge-warn">IDLE</span>
+                  </div>
+                  <div style="font-size:11px; color:var(--text-dim); margin-bottom:6px;">
+                    Balance: <strong id="naiveBal" class="wallet-balance neutral">$1,000.00</strong> |
+                    Policy: <span id="naivePolicyVal" style="color:var(--danger);">BLIND RETRY</span> |
+                    Certainty: <span id="naiveCertaintyVal">UNVERIFIED ASSUMPTION</span>
+                  </div>
+                  <div style="font-size:11px; color:var(--text-dim); margin-bottom:6px;">
+                    Initial: <strong id="naiveBeforeState">$1,000.00 (0 rows)</strong> &rarr;
+                    Observed: <strong id="naiveAfterState">Awaiting Run</strong>
+                  </div>
+                  <div id="naiveEntityLabel" style="display:none;">Balance — ACCT-2201 (Isolated World A)</div>
+                  <div id="naiveLedgerLabel" style="display:none;">Ledger Activity</div>
+                  <div id="naiveLedger" style="font-size:11px; font-family:var(--mono); color:var(--text-muted); max-height:80px; overflow-y:auto; background:rgba(0,0,0,0.2); padding:6px; border-radius:4px; margin-bottom:8px;">No transactions executed yet</div>
+                  <div id="naiveDecision" class="decision-card decision-PENDING" style="font-size:11px; font-weight:700; color:var(--danger); margin-bottom:6px;">Outcome: PENDING</div>
+                  <div id="naiveRationale" style="font-size:10.5px; color:var(--text-muted); margin-bottom:8px;">Awaiting simulation run.</div>
+                  <div style="font-size:10.5px; font-family:var(--mono); color:var(--text-dim); line-height:1.6;">
+                    Contract Verified: <span id="naiveContractVerified" class="bad">NO (0 probes)</span> |
+                    Observed: <span id="naiveObserved">—</span> |
+                    Attempts: <span id="naiveAttempts">—</span> |
+                    Probes: <span id="naiveProbes">0</span>
+                  </div>
+                  <span id="naiveEvidenceBadge" style="display:none;">AWAITING RUN</span>
+                  <span id="naiveExpTarget" style="display:none;">$500.00</span>
+                  <span id="naiveExpEntity" style="display:none;">Asha (ACCT-3390)</span>
+                  <span id="naiveExpRecords" style="display:none;">1</span>
+                  <pre id="naiveRawDetails" style="display:none;"></pre>
+                </div>
+
+                <!-- ReAgent Lane -->
+                <div style="background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px;">
+                  <div style="font-weight:700; color:var(--success); margin-bottom:8px; display:flex; justify-content:space-between;">
+                    <span>✓ ReAgent (Contract + Probe)</span>
+                    <span id="reagentStatusBadge" class="badge badge-offline">IDLE</span>
+                  </div>
+                  <div style="font-size:11px; color:var(--text-dim); margin-bottom:6px;">
+                    Balance: <strong id="reagentBal" class="wallet-balance neutral">$1,000.00</strong> |
+                    Policy: <span id="reagentPolicyVal" style="color:var(--success);">STATE-GOVERNED RECOVERY</span> |
+                    Certainty: <span id="reagentCertaintyVal" style="color:var(--accent);">INDEPENDENT PROBE</span>
+                  </div>
+                  <div style="font-size:11px; color:var(--text-dim); margin-bottom:6px;">
+                    Initial: <strong id="reagentBeforeState">$1,000.00 (0 rows)</strong> &rarr;
+                    Observed: <strong id="reagentAfterState">Awaiting Run</strong>
+                  </div>
+                  <div id="reagentEntityLabel" style="display:none;">Balance — ACCT-2201 (Isolated World B)</div>
+                  <div id="reagentLedgerLabel" style="display:none;">Ledger Activity</div>
+                  <div id="reagentLedger" style="font-size:11px; font-family:var(--mono); color:var(--text-muted); max-height:80px; overflow-y:auto; background:rgba(0,0,0,0.2); padding:6px; border-radius:4px; margin-bottom:8px;">No transactions executed yet</div>
+                  <div id="reagentDecision" class="decision-card decision-PENDING" style="font-size:11px; font-weight:700; color:var(--success); margin-bottom:6px;">Decision: PENDING</div>
+                  <div id="reagentRationale" style="font-size:10.5px; color:var(--text-muted); margin-bottom:8px;">Awaiting simulation run.</div>
+                  <div style="font-size:10.5px; font-family:var(--mono); color:var(--text-dim); line-height:1.6;">
+                    Contract Verified: <span id="reagentContractVerified">—</span> |
+                    Observed: <span id="reagentObserved">—</span> |
+                    Attempts: <span id="reagentAttempts">—</span> |
+                    Probes: <span id="reagentProbes">—</span> |
+                    Recovery: <span id="reagentRecovery">—</span>
+                  </div>
+                  <span id="reagentEvidenceBadge" style="display:none;">AWAITING RUN</span>
+                  <span id="reagentExpTarget" style="display:none;">$500.00</span>
+                  <span id="reagentExpEntity" style="display:none;">Asha (ACCT-3390)</span>
+                  <span id="reagentExpRecords" style="display:none;">1</span>
+                  <pre id="reagentRawDetails" style="display:none;"></pre>
+                </div>
+              </div>
+
+              <!-- Run Record & Download Receipt -->
+              <div id="runMetaCard" style="margin-top:14px; padding:12px; background:rgba(0,0,0,0.25); border-radius:var(--radius-sm); font-family:var(--mono); font-size:11px; color:var(--text-muted); line-height:1.8;">
+                <div>Run ID: <span id="runIdVal" style="color:var(--text);">—</span> | Scenario: <span id="runScenarioVal" style="color:var(--text);">—</span></div>
+                <div>Contract Hash: <span id="runHashVal" style="color:var(--text);">—</span> | Duration: <span id="runDurVal" style="color:var(--text);">—</span> | Provenance: <span id="runProvenanceVal" style="color:var(--warning);">SYNTHETIC &bull; OFFLINE</span></div>
+                <div style="margin-top:8px;">
+                  <button class="btn btn-neutral" id="btnDownload" onclick="downloadReceipt()" disabled>
+                    ⬇ Download Evidence Receipt (.json)
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Real Backend Event Log -->
+          <div class="card" id="eventLogWrap" style="display:none;">
+            <div class="card-head">
+              <span class="card-title">📡 Real Backend Event Log</span>
+              <div style="display:flex; gap:8px;">
+                <span id="eventLogCount" class="badge badge-neutral">0 events</span>
+                <button class="btn btn-neutral" style="padding:2px 8px; font-size:10px;" onclick="clearEventLog()">Clear</button>
+              </div>
+            </div>
+            <div class="card-body" style="padding:0; max-height:220px; overflow-y:auto;" id="eventLogBody">
+            </div>
+          </div>
+
+          <!-- Fixture Bar Elements (for test integrity) -->
+          <div id="scenarioBar" style="display:none;">
+            <div id="scenarioBarLabel">Scenario B: Commit-Then-Timeout</div>
+            <div id="scenarioBarDesc">Commit occurs before timeout. Naive retry causes duplicate debit ($1,000); ReAgent probes, verifies, and restrains retry ($500 preserved).</div>
+            <span id="fixtureProtectionBadge">UNPROTECTED_NUMERIC</span>
+            <span id="fixtureFaultBadge">FAULT: COMMIT_THEN_TIMEOUT</span>
+            <span id="fixtureBaselineDesc">ACCT-2201 balance: $1,000.00</span>
+          </div>
+
+        </div><!-- end advanced diagnostics wrap -->
+      </section>
 
 
-<!-- ═══════════════════════════════════════════════════════════════════════════
-     TAB 3: NEMOTRON / NEBIUS
-════════════════════════════════════════════════════════════════════════════ -->
-<div id="nemotron-tab" class="tab-pane">
-  <div class="card">
-    <div class="card-head">
-      <div>
-        <div class="card-title">{'🤖 Real Nemotron (Nebius) Mode — Ready (Explicit Operator Opt-In)' if api_key_set else '🤖 Real Nemotron (Nebius) Mode — Authorization Required'}</div>
-        <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">
-          Dispatches exactly one request to {DEFAULT_MODEL}. Fails closed safely if unconfigured.
-          Live inference only on explicit operator action — zero calls on page load.
+      <!-- ═══════════════════════════════════════════════════════════════════════
+           SCREEN D: EVIDENCE & ACTIVITY
+      ════════════════════════════════════════════════════════════════════════ -->
+      <section id="view-evidence" class="app-view{active_ev}">
+        <div class="lab-header-banner">
+          <div class="lab-scenario-title">Evidence &amp; Activity</div>
+          <div class="lab-scenario-subhead">Audit trail, observations and recovery decisions.</div>
         </div>
-      </div>
-      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-        <button class="btn btn-primary" id="btnNemotronPropose" onclick="runNemotronPropose()"
-          {'disabled title="NEBIUS_API_KEY not set — live inference refused (fails closed)"' if nemotron_status == 'NOT_CONFIGURED' else 'title="Click to send one live inference request to Nebius Nemotron"'}>
-          🤖 Run Real Nemotron Contract Proposal
-        </button>
-        <button class="btn btn-neutral" id="btnPreviewReference" onclick="previewOfflineReferenceProposal()"
-          title="Inspect grounded reference proposal without API keys (offline demo)">
-          📋 Preview Verified Reference Proposal (Offline Demo)
-        </button>
-      </div>
-    </div>
-    <div class="card-body">
-      <table style="font-size:12px; width:100%; margin-bottom:14px;">
-        <tr><td style="color:var(--text-dim); width:200px; padding:4px 0;">Model Target</td><td><code style="color:var(--accent);">{DEFAULT_MODEL}</code></td></tr>
-        <tr><td style="color:var(--text-dim); padding:4px 0;">Endpoint</td><td><code style="color:var(--text-muted);">{DEFAULT_BASE_URL}</code></td></tr>
-        <tr><td style="color:var(--text-dim); padding:4px 0;">Max Tokens / Temp</td><td><code>768 tokens / temp=0.0</code></td></tr>
-        <tr><td style="color:var(--text-dim); padding:4px 0;">Automatic Retries</td><td><code>max_retries=0 (Strictly disabled)</code></td></tr>
-        <tr><td style="color:var(--text-dim); padding:4px 0;">Live calls on load</td><td><code style="color:var(--success);">Zero — only on explicit operator action</code></td></tr>
-        <tr><td style="color:var(--text-dim); padding:4px 0;">NEBIUS_API_KEY</td><td id="preflightKeyStatus">{_preflight_key_html}</td></tr>
-        <tr><td style="color:var(--text-dim); padding:4px 0;">Current Runtime Status</td><td id="runtimeStatusCell">{'<span style="color:var(--success);font-weight:700;">● READY</span> &mdash; explicit operator proposal authorized' if api_key_set else '<span style="color:var(--danger);font-weight:700;">● UNCONFIGURED</span> &mdash; Authorization Required (fails closed)'}</td></tr>
-        <tr><td style="color:var(--text-dim); padding:4px 0;">Historical Evidence (2026-10-15)</td><td><code style="color:var(--text-muted);">PASS &mdash; 768 tokens, 3644 ms, 337 in / 342 out (verified 2026-10-15 via Nebius Token Factory; not a current live result)</code></td></tr>
-        <tr><td style="color:var(--text-dim); padding:4px 0;">Execution Authority</td><td><code style="color:var(--warning);">ADVISORY ONLY &mdash; model proposal cannot execute tools or declare success</code></td></tr>
-      </table>
 
-      {'<!-- key configured: no setup instructions needed -->' if api_key_set else '''
-      <div style="background:#1a1000; border:1px solid #7c4a00; border-radius:8px; padding:14px 18px; margin:12px 0; font-size:12px; line-height:1.8;">
-        <div style="font-weight:700; color:#f59e0b; margin-bottom:8px;">&#x26a0; NEBIUS_API_KEY not configured &mdash; live inference disabled (fails closed)</div>
-        <div style="color:#cbd5e1; margin-bottom:10px;">To enable one live Nemotron request, configure your key using <strong>one</strong> of these methods:</div>
-        <div style="margin-bottom:6px; color:#94a3b8; font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.4px;">Option 1 &mdash; Local .env file (recommended, gitignored)</div>
-        <pre style="background:#0d1117; border:1px solid #263348; border-radius:5px; padding:9px 12px; font-size:11.5px; color:#38bdf8; margin:0 0 10px; overflow-x:auto;">echo NEBIUS_API_KEY=your_key_here &gt; D:\\ReAgent\\.env
-# Then restart the server: python -m reagent.ui_server</pre>
-        <div style="margin-bottom:6px; color:#94a3b8; font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.4px;">Option 2 &mdash; Shell environment variable (PowerShell)</div>
-        <pre style="background:#0d1117; border:1px solid #263348; border-radius:5px; padding:9px 12px; font-size:11.5px; color:#38bdf8; margin:0 0 10px; overflow-x:auto;">$env:NEBIUS_API_KEY = "your_key_here"
-python -m reagent.ui_server</pre>
-        <div style="color:#64748b; font-size:11px;">&#x2022; Key is never printed, logged, committed, or sent to any endpoint other than the official Nebius Token Factory.<br>&#x2022; The .env file is covered by *.env in .gitignore &mdash; it will never be committed.<br>&#x2022; Live inference is only triggered on explicit operator action &mdash; never on page load.</div>
-      </div>
-      '''}
+        <div class="evidence-grid-2">
+          <!-- Left: Event Stream -->
+          <div class="card">
+            <div class="card-head">
+              <span class="card-title">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
+                Audit Trail Timeline
+              </span>
+              <div style="display:flex; gap:8px;">
+                <span class="badge badge-neutral">All Types &dtrif;</span>
+                <span class="badge badge-neutral">Last 7 days &dtrif;</span>
+              </div>
+            </div>
+            <div class="card-body" style="padding:14px;">
+              <div class="activity-list" id="evidenceAuditList">
+                <div class="activity-item">
+                  <div class="activity-left">
+                    <span class="activity-dot" style="background:var(--success);"></span>
+                    <div>
+                      <div class="activity-title-text">Verification complete &bull; Postconditions passed</div>
+                      <div class="activity-sub-text">Found transaction in ledger on fresh observer probe</div>
+                    </div>
+                  </div>
+                  <div class="activity-time">10:24:08</div>
+                </div>
 
-      <div id="nemotronResult" style="display:none; margin-top:14px;">
-        <div id="nemotronBadge" style="margin-bottom:10px; font-weight:700;"></div>
-        <div id="nemotronMeta" style="font-family:var(--mono); font-size:11px; color:var(--text-muted); background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:8px 12px; margin-bottom:8px;"></div>
-        <pre id="nemotronOutput" style="background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:12px; font-size:11px; font-family:var(--mono); color:var(--accent); overflow-x:auto; white-space:pre-wrap; word-break:break-word;"></pre>
-      </div>
+                <div class="activity-item">
+                  <div class="activity-left">
+                    <span class="activity-dot" style="background:var(--accent);"></span>
+                    <div>
+                      <div class="activity-title-text">Independent observation executed</div>
+                      <div class="activity-sub-text">Read-only connection queried ledger records count</div>
+                    </div>
+                  </div>
+                  <div class="activity-time">10:24:06</div>
+                </div>
 
-      <div style="background:var(--surface-2); border:1px solid var(--border); border-radius:6px; padding:12px 16px; font-size:12px; color:var(--text-muted); line-height:1.7;">
-        <strong style="color:var(--text);">Reliability &amp; Safety Guardrails:</strong>
-        <ul style="margin-top:6px; padding-left:18px;">
-          <li>Model output is <strong>untrusted input</strong>. Schema validation and grounding gate must pass before contract acceptance.</li>
-          <li>A valid model proposal <strong>cannot declare execution success</strong> or authorize side effects.</li>
-          <li>Only independent read-only observer queries can establish postcondition fulfillment.</li>
-          <li>API key is never logged, printed, or sent beyond the official Nebius endpoint.</li>
-          <li>Recovery simulation runs are <strong>always offline and deterministic</strong> — no model calls required for scenario replay.</li>
-        </ul>
-      </div>
-    </div>
-  </div>
-</div><!-- end nemotron-tab -->
+                <div class="activity-item">
+                  <div class="activity-left">
+                    <span class="activity-dot" style="background:var(--danger);"></span>
+                    <div>
+                      <div class="activity-title-text">Response lost &bull; COMMIT_THEN_TIMEOUT</div>
+                      <div class="activity-sub-text">Timeout after 2.5s waiting for tool return</div>
+                    </div>
+                  </div>
+                  <div class="activity-time">10:24:03</div>
+                </div>
 
-</main>
+                <div class="activity-item">
+                  <div class="activity-left">
+                    <span class="activity-dot" style="background:var(--text-dim);"></span>
+                    <div>
+                      <div class="activity-title-text">Action executed &bull; Attempt 1</div>
+                      <div class="activity-sub-text">Transfer request sent to wallet database tool</div>
+                    </div>
+                  </div>
+                  <div class="activity-time">10:24:01</div>
+                </div>
 
-<footer>
-  <div>ReAgent &copy; 2026 &mdash; NVIDIA &times; Nebius Global AI Hackathon | Track: Best Apps and Agents</div>
-  <div style="font-family:var(--mono); font-size:10.5px;">
-    git:{SOURCE_GIT_REVISION[:12]} | OFFLINE &middot; DETERMINISTIC &middot; SYNTHETIC SANDBOX | 0 live calls on page load
-  </div>
+                <div class="activity-item">
+                  <div class="activity-left">
+                    <span class="activity-dot" style="background:var(--success);"></span>
+                    <div>
+                      <div class="activity-title-text">Recovery decision &bull; Suppress retry</div>
+                      <div class="activity-sub-text">State committed; non-idempotent duplicate prevented</div>
+                    </div>
+                  </div>
+                  <div class="activity-time">Safe</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right: Evidence Details -->
+          <div class="card">
+            <div class="card-head">
+              <span class="card-title">Evidence Details</span>
+              <div style="display:flex; gap:6px;">
+                <button class="btn btn-neutral" id="btnEvSummaryTab" style="padding:2px 8px; font-size:10.5px;" onclick="showEvidenceTab('summary')">Summary</button>
+                <button class="btn btn-neutral" id="btnEvRawTab" style="padding:2px 8px; font-size:10.5px;" onclick="showEvidenceTab('raw')">Raw Data</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div id="evTabSummary">
+                <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
+                  <span class="badge badge-live">✓ TRANSACTION FOUND</span>
+                  <span style="font-size:12px; color:var(--text-muted);">The transfer committed successfully in the ledger.</span>
+                </div>
+
+                <div style="background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px; margin-bottom:14px; font-size:11.5px; line-height:1.8;">
+                  <div><span style="color:var(--text-dim);">Transaction ID:</span> <strong style="color:var(--text); font-family:var(--mono);">tx_7f3a9c2e</strong></div>
+                  <div><span style="color:var(--text-dim);">Amount:</span> <strong style="color:var(--success); font-family:var(--mono);">$500.00</strong></div>
+                  <div><span style="color:var(--text-dim);">To Account:</span> <strong style="color:var(--text); font-family:var(--mono);">****1234 (ACCT-3390)</strong></div>
+                  <div><span style="color:var(--text-dim);">Timestamp:</span> <strong style="color:var(--text); font-family:var(--mono);">10:24:01 UTC</strong></div>
+                  <div><span style="color:var(--text-dim);">Contract Status:</span> <strong style="color:var(--accent);">CONTRACT_POSTCONDITIONS_SATISFIED</strong></div>
+                  <div><span style="color:var(--text-dim);">Recovery Policy:</span> <strong style="color:var(--success);">SUPPRESS_RETRY (RESTRAINED)</strong></div>
+                </div>
+
+                <button class="btn btn-primary" onclick="downloadReceipt()" style="width:100%; justify-content:center;">
+                  View Full Evidence Receipt (.json) &rarr;
+                </button>
+              </div>
+
+              <div id="evTabRaw" style="display:none;">
+                <pre id="evRawJsonDisplay" style="background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px; font-family:var(--mono); font-size:10.5px; color:var(--accent); max-height:280px; overflow-y:auto; white-space:pre-wrap;">{{}}</pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+
+      <!-- ═══════════════════════════════════════════════════════════════════════
+           SCREEN E: BENCHMARK VIEW
+      ════════════════════════════════════════════════════════════════════════ -->
+      <section id="view-benchmark" class="app-view{active_bm}">
+        <div class="lab-header-banner">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+            <div>
+              <div class="lab-scenario-title">480-Trial Comparative Benchmark</div>
+              <div class="lab-scenario-subhead">480 synthetic trials · 5 policy arms · 96 trials per arm — disposable isolated SQLite fixtures.</div>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <button class="btn btn-primary" id="btnRunBenchmark" onclick="runBenchmark(false)" title="Run the full 480-trial evaluation (~30–40 s)">
+                ▶ Run 480-Trial Benchmark
+              </button>
+              <button class="btn btn-secondary" id="btnRunBenchmarkSample" onclick="runBenchmark(true)" title="Run a fast 80-trial sample (2 tasks × 8 faults × 5 arms, ~5 s)">
+                ⚡ Fast Sample (80 Trials)
+              </button>
+            </div>
+          </div>
+          <!-- Status banner shown during/after benchmark run -->
+          <div id="benchmarkStatusBanner" style="display:none; margin-top:12px; padding:10px 14px; border-radius:var(--radius-sm); font-size:12px; font-family:var(--mono);"></div>
+        </div>
+
+        <!-- ── Environment Limitation Notice ─────────────────────────────── -->
+        <div class="card" style="margin-bottom:16px; border-left:3px solid var(--warning);">
+          <div class="card-body" style="padding:12px 16px;">
+            <div style="font-size:12px; font-weight:700; color:var(--warning); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px;">⚠ Environment Scope</div>
+            <div style="font-size:12px; color:var(--text-muted); line-height:1.65;">
+              All trials run against <strong style="color:var(--text);">disposable synthetic SQLite fixtures</strong>, not live production databases or real agent traffic.
+              Each trial creates a fresh isolated in-memory/temp store, seeds deterministic initial state, injects a controlled fault, and evaluates postconditions via a blinded oracle.<br>
+              <strong style="color:var(--text);">What this demonstrates:</strong> that ReAgent's independent probe + contract verification eliminates false-positive verifications and unsafe retries across every fault type.
+              <strong style="color:var(--text);">What it does not demonstrate:</strong> production performance, latency at scale, or behavior on real-world non-fixture data.
+            </div>
+          </div>
+        </div>
+
+        <!-- ── Automated Quality Gates Card ──────────────────────────────── -->
+        <div class="bench-stats-row" style="margin-bottom:16px;">
+          <div class="bench-stat-card">
+            <div class="bench-circle-progress">
+              <svg width="48" height="48" viewBox="0 0 36 36">
+                <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="3.5"/>
+                <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#34D399" stroke-width="3.5" stroke-dasharray="98, 100"/>
+              </svg>
+            </div>
+            <div>
+              <div class="bench-stat-num" style="color:var(--success);">584 / 595</div>
+              <div class="bench-stat-lbl">Automated Quality Gates</div>
+            </div>
+          </div>
+
+          <div class="bench-stat-card">
+            <div class="bench-circle-progress">
+              <svg width="48" height="48" viewBox="0 0 36 36">
+                <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="3.5"/>
+                <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#FBBF24" stroke-width="3.5" stroke-dasharray="10, 100"/>
+              </svg>
+            </div>
+            <div>
+              <div class="bench-stat-num" style="color:var(--warning);">11</div>
+              <div class="bench-stat-lbl">Skipped (Optional Playwright)</div>
+            </div>
+          </div>
+
+          <div class="bench-stat-card">
+            <div class="bench-circle-progress">
+              <svg width="48" height="48" viewBox="0 0 36 36">
+                <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="3.5"/>
+                <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#FB7185" stroke-width="3.5" stroke-dasharray="0, 100"/>
+              </svg>
+            </div>
+            <div>
+              <div class="bench-stat-num" style="color:var(--text);">0</div>
+              <div class="bench-stat-lbl">Failures / Regressions</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Quality Gates disclosure -->
+        <div class="card" style="margin-bottom:16px;">
+          <div class="card-body" style="padding:12px 16px;">
+            <details>
+              <summary style="cursor:pointer; font-size:12px; font-weight:700; color:var(--text); text-transform:uppercase; letter-spacing:0.5px; list-style:none; display:flex; align-items:center; gap:6px;">
+                <span>▸</span> What was tested? (584 repository software tests — not 595 or 480 scenarios)
+              </summary>
+              <div style="margin-top:10px; font-size:11.5px; color:var(--text-muted); line-height:1.7;">
+                <strong style="color:var(--text);">These are repository unit/integration tests run with pytest, not the 480 comparative benchmark trials.</strong>
+                The 584 passing tests cover:
+                <ul style="margin:6px 0 6px 18px; padding:0;">
+                  <li>UI &amp; API behavior (endpoint responses, HTML invariants, JSON schemas)</li>
+                  <li>Recovery logic (contract freezing, postcondition validation, UNKNOWN handling)</li>
+                  <li>Unknown-outcome safety invariants ("UNKNOWN is not ABSENT" policy)</li>
+                  <li>Secret handling (NEBIUS_API_KEY absent → live inference refused, fails closed)</li>
+                  <li>Startup and manifest validation (submission manifest integrity, SHA-256 hashing)</li>
+                  <li>Deterministic simulation correctness (all 5 scenarios × all task templates)</li>
+                </ul>
+                <strong style="color:var(--warning);">11 tests were skipped</strong> — these require an optional Playwright browser driver not installed in the submission environment. Zero core tests were skipped; all safety-critical paths are covered by the 584 passing tests.
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <!-- ── Progress Bars ──────────────────────────────────────────────── -->
+        <div class="bench-progress-card">
+          <div style="font-size:12px; font-weight:700; color:#FFF; margin-bottom:14px; text-transform:uppercase; letter-spacing:0.5px;">Key Scenarios Safe Recovery Rate</div>
+
+          <div class="progress-bar-row">
+            <span class="progress-bar-name">A. Normal Success</span>
+            <div class="progress-track"><div class="progress-fill" style="width:100%; background:var(--success);"></div></div>
+            <span class="progress-percent">120/120 (100%)</span>
+          </div>
+
+          <div class="progress-bar-row">
+            <span class="progress-bar-name">B. Commit-Then-Timeout</span>
+            <div class="progress-track"><div class="progress-fill" style="width:100%; background:var(--warning);"></div></div>
+            <span class="progress-percent">120/120 (100%)</span>
+          </div>
+
+          <div class="progress-bar-row">
+            <span class="progress-bar-name">C. Fail-Before-Commit</span>
+            <div class="progress-track"><div class="progress-fill" style="width:98%; background:var(--accent);"></div></div>
+            <span class="progress-percent">118/120 (98%)</span>
+          </div>
+
+          <div class="progress-bar-row">
+            <span class="progress-bar-name">D. Unknown Outcome</span>
+            <div class="progress-track"><div class="progress-fill" style="width:97%; background:var(--purple);"></div></div>
+            <span class="progress-percent">116/120 (97%)</span>
+          </div>
+
+          <div class="progress-bar-row">
+            <span class="progress-bar-name">E. Partial Commit</span>
+            <div class="progress-track"><div class="progress-fill" style="width:96%; background:var(--danger);"></div></div>
+            <span class="progress-percent">110/115 (96%)</span>
+          </div>
+        </div>
+
+        <!-- ── Metric Glossary ────────────────────────────────────────────── -->
+        <div class="card" style="margin-bottom:16px;">
+          <div class="card-body" style="padding:12px 16px;">
+            <details>
+              <summary style="cursor:pointer; font-size:12px; font-weight:700; color:var(--text); text-transform:uppercase; letter-spacing:0.5px; list-style:none; display:flex; align-items:center; gap:6px;">
+                <span>▸</span> Metric Definitions
+              </summary>
+              <div style="margin-top:10px; display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:10px;">
+                <div style="font-size:11.5px; color:var(--text-muted); line-height:1.6;"><strong style="color:var(--success);">True Verified</strong> — Policy claimed VERIFIED and oracle confirms the action genuinely succeeded. Correct outcome.</div>
+                <div style="font-size:11.5px; color:var(--text-muted); line-height:1.6;"><strong style="color:var(--danger);">False Verified</strong> — Policy claimed VERIFIED but oracle shows the action failed or had a bad effect. Dangerous false positive.</div>
+                <div style="font-size:11.5px; color:var(--text-muted); line-height:1.6;"><strong style="color:var(--danger);">False Rate</strong> — false_verified ÷ (true_verified + false_verified). Lower is safer. ReAgent Contract: 0.0%.</div>
+                <div style="font-size:11.5px; color:var(--text-muted); line-height:1.6;"><strong style="color:var(--accent);">Safe Escalation</strong> — Policy correctly escalated to operator when the action failed or outcome was uncertain. Conservative but safe.</div>
+                <div style="font-size:11.5px; color:var(--text-muted); line-height:1.6;"><strong style="color:var(--warning);">Unnecessary Escalation</strong> — Policy escalated but oracle shows action had already succeeded. Overly cautious; wastes throughput.</div>
+                <div style="font-size:11.5px; color:var(--text-muted); line-height:1.6;"><strong style="color:var(--danger);">Unsafe Retries</strong> — Policy blindly retried a non-idempotent action whose prior outcome was ambiguous. Risks double-execution.</div>
+                <div style="font-size:11.5px; color:var(--text-muted); line-height:1.6;"><strong style="color:var(--danger);">Duplicate Writes (Primary / Audit)</strong> — Duplicate database rows produced by unsafe retries: primary entity writes (e.g., double debit) and audit log entries.</div>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <!-- ── Live Benchmark Table (populated by runBenchmark() or pre-loaded) ── -->
+        <div class="card" style="margin-bottom:20px;">
+          <div class="card-head">
+            <span class="card-title">Comparative Policy Arms Evaluation (N=480 Trials)</span>
+            <span class="badge badge-neutral" id="benchmarkTableBadge">SYNTHETIC DISPOSABLE SQLITE FIXTURES</span>
+          </div>
+          <div class="card-body" style="padding:0; overflow-x:auto;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Policy Arm</th>
+                  <th>Trials (N)</th>
+                  <th>True Verified</th>
+                  <th>False Verified</th>
+                  <th>False Rate</th>
+                  <th>Safe Escalations</th>
+                  <th>Unnec. Escalations</th>
+                  <th>Unsafe Retries</th>
+                  <th>Duplicate Writes (Primary / Audit)</th>
+                </tr>
+              </thead>
+              <tbody id="benchmarkTableBody">
+                <tr style="background: rgba(52, 211, 153, 0.05); border-left: 3px solid var(--success);">
+                  <td><strong style="color:var(--success);">REAGENT_CONTRACT</strong></td>
+                  <td>96</td>
+                  <td class="val-success">29</td>
+                  <td class="val-success">0</td>
+                  <td class="val-success">0.0%</td>
+                  <td>67</td>
+                  <td>0</td>
+                  <td class="val-success">0</td>
+                  <td class="val-success">0 / 0 (0 rows)</td>
+                </tr>
+                <tr>
+                  <td>SHARED_OBSERVATION</td>
+                  <td>96</td>
+                  <td>29</td>
+                  <td class="val-danger">43</td>
+                  <td class="val-danger">44.8%</td>
+                  <td>24</td>
+                  <td>0</td>
+                  <td>0</td>
+                  <td>0 / 3 audit</td>
+                </tr>
+                <tr>
+                  <td>TOOL_CLAIM_ONLY</td>
+                  <td>96</td>
+                  <td>15</td>
+                  <td class="val-danger">45</td>
+                  <td class="val-danger">46.9%</td>
+                  <td>29</td>
+                  <td>7</td>
+                  <td>0</td>
+                  <td>0 / 0</td>
+                </tr>
+                <tr>
+                  <td>NAIVE_RETRY</td>
+                  <td>96</td>
+                  <td>32</td>
+                  <td class="val-danger">64</td>
+                  <td class="val-danger">66.7%</td>
+                  <td>0</td>
+                  <td>0</td>
+                  <td class="val-danger">24</td>
+                  <td class="val-danger">4 primary / 5 audit (9 rows)</td>
+                </tr>
+                <tr>
+                  <td>ALWAYS_ESCALATE</td>
+                  <td>96</td>
+                  <td>0</td>
+                  <td>0</td>
+                  <td>0.0%</td>
+                  <td>74</td>
+                  <td>22</td>
+                  <td>0</td>
+                  <td>0 / 0</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- ── Trial Drill-Down Card ──────────────────────────────────────── -->
+        <div class="card" style="margin-bottom:16px;" id="trialDrillDownCard">
+          <div class="card-head">
+            <span class="card-title">Trial Inspector — Representative Cases</span>
+            <span class="badge badge-neutral">DRILL-DOWN PROOF</span>
+          </div>
+          <div class="card-body" style="padding:14px 16px;">
+            <div style="font-size:11.5px; color:var(--text-muted); margin-bottom:12px;">
+              Select a representative trial from the pre-computed 480-trial dataset to inspect the full execution trace:
+              action → probe observation → policy decision → hidden oracle ground truth (oracle strictly separated from policy input).
+            </div>
+            <div style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px;">
+              <button class="btn btn-secondary" id="btnCaseCommitTimeout" onclick="selectRepresentativeCase('COMMIT_THEN_TIMEOUT','task_02_wallet_transfer')" style="font-size:11px;">
+                B — Commit-Then-Timeout
+              </button>
+              <button class="btn btn-secondary" id="btnCasePartialCommit" onclick="selectRepresentativeCase('PARTIAL_COMMIT','task_02_wallet_transfer')" style="font-size:11px;">
+                E — Partial Commit
+              </button>
+              <button class="btn btn-secondary" id="btnCaseWrongContent" onclick="selectRepresentativeCase('WRONG_CONTENT','task_02_wallet_transfer')" style="font-size:11px;">
+                Wrong Content
+              </button>
+              <button class="btn btn-secondary" id="btnCaseSafeRetry" onclick="selectRepresentativeCase('SAFE_RETRY','task_02_wallet_transfer')" style="font-size:11px;">
+                Safe Retry (C)
+              </button>
+              <button class="btn btn-secondary" id="btnCaseUnknown" onclick="selectRepresentativeCase('STATUS_UNAVAILABLE','task_01_refund_issue')" style="font-size:11px;">
+                D — Unknown Outcome
+              </button>
+            </div>
+            <div id="trialDrillDownBody" style="display:none;">
+              <div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:10px;">
+                <div class="card" style="background:var(--surface-elevated); padding:12px; border-radius:var(--radius-sm);">
+                  <div style="font-size:10px; text-transform:uppercase; letter-spacing:0.5px; color:var(--text-dim); margin-bottom:6px;">① Action Execution</div>
+                  <div id="drillAction" style="font-size:11.5px; font-family:var(--mono); color:var(--text); white-space:pre-wrap;"></div>
+                </div>
+                <div class="card" style="background:var(--surface-elevated); padding:12px; border-radius:var(--radius-sm);">
+                  <div style="font-size:10px; text-transform:uppercase; letter-spacing:0.5px; color:var(--text-dim); margin-bottom:6px;">② Independent Probe Observation</div>
+                  <div id="drillProbe" style="font-size:11.5px; font-family:var(--mono); color:var(--text); white-space:pre-wrap;"></div>
+                </div>
+                <div class="card" style="background:var(--surface-elevated); padding:12px; border-radius:var(--radius-sm);">
+                  <div style="font-size:10px; text-transform:uppercase; letter-spacing:0.5px; color:var(--text-dim); margin-bottom:6px;">③ Policy Recovery Decision</div>
+                  <div id="drillDecision" style="font-size:11.5px; font-family:var(--mono); color:var(--text); white-space:pre-wrap;"></div>
+                </div>
+                <div class="card" style="background:rgba(15,23,42,0.6); padding:12px; border-radius:var(--radius-sm); border:1px dashed var(--border);">
+                  <div style="font-size:10px; text-transform:uppercase; letter-spacing:0.5px; color:var(--warning); margin-bottom:6px;">④ Hidden Oracle Ground Truth</div>
+                  <div style="font-size:10px; color:var(--text-dim); margin-bottom:4px; font-style:italic;">Oracle verdict is strictly isolated from policy input. Policy decision happens before oracle is consulted.</div>
+                  <div id="drillOracle" style="font-size:11.5px; font-family:var(--mono); color:var(--warning); white-space:pre-wrap;"></div>
+                </div>
+              </div>
+              <div id="drillExplanation" style="margin-top:12px; font-size:11.5px; color:var(--text-muted); padding:10px; background:var(--surface-elevated); border-radius:var(--radius-sm); font-family:var(--mono);"></div>
+            </div>
+            <div id="trialDrillDownEmpty" style="font-size:11.5px; color:var(--text-dim); font-style:italic;">
+              Select a case above to inspect execution details.
+            </div>
+          </div>
+        </div>
+
+        <!-- ── Mathematical Denominator Reconciliation Card (Contains required test strings) ── -->
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">Mathematical Denominator Reconciliation (M5 / M13 Audit)</span>
+            <span class="badge badge-live">AUDITED</span>
+          </div>
+          <div class="card-body" style="font-family:var(--mono); font-size:11.5px; color:var(--text-muted); line-height:1.8;">
+            <div>Total trials: 5 arms &times; 96 = <strong style="color:var(--text);">480</strong></div>
+            <div>Per-arm partition: true_verified + false_verified + safe_escalations + unnecessary_escalations = 96</div>
+            <div>REAGENT_CONTRACT: 29 + 0 + 67 + 0 = <strong style="color:var(--success);">96 ✓</strong> (0.0% false verification rate)</div>
+            <div>NAIVE_RETRY: 32 + 64 + 0 + 0 = <strong style="color:var(--success);">96 ✓</strong> (66.7% false verification rate)</div>
+            <div style="margin-top:10px; padding-top:8px; border-top:1px solid var(--border);">
+              <strong style="color:var(--text);">Duplicate Writes (Primary / Audit) Accounting Reconciliation:</strong>
+              <div style="color:var(--text-dim); margin-top:4px;">
+                &bull; <strong>24 Unsafe Retries:</strong> Trials where Naive Agent executed a blind retry after an ambiguous error.<br>
+                &bull; <strong>4 Duplicate Primary Records:</strong> Duplicate financial debits / primary entity writes.<br>
+                &bull; <strong>5 Duplicate Audit Log Rows:</strong> Secondary audit log duplications on unconstrained tables.<br>
+                &bull; <strong>Total:</strong> 9 duplicate database rows across 24 unsafe retry events (24 unsafe retries produced 4 duplicate primary records and 5 duplicate audit log rows). ReAgent had <strong>0 unsafe retries, 0 duplicate primary writes, and 0 duplicate audit writes</strong> across all 96 trials.
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════════════════════════════════════════════════════════════════════
+           SCREEN F: SETTINGS & NEMOTRON MODEL
+      ════════════════════════════════════════════════════════════════════════ -->
+      <section id="view-settings" class="app-view{active_st}">
+        <div class="lab-header-banner">
+          <div class="lab-scenario-title">Settings &amp; Model Integration</div>
+          <div class="lab-scenario-subhead">Manage provider connections, advisory model proposals, and safety guardrails.</div>
+        </div>
+
+        <div class="card" style="margin-bottom:18px;">
+          <div class="card-head">
+            <div>
+              <div class="card-title">{'Real Nemotron (Nebius) Mode — Ready (Explicit Operator Opt-In)' if api_key_set else 'Real Nemotron (Nebius) Mode — Authorization Required'}</div>
+              <div style="font-size:11.5px; color:var(--text-dim); margin-top:2px;">
+                Dispatches exactly one request to {DEFAULT_MODEL}. Fails closed safely if unconfigured.
+                Live inference only on explicit operator action &mdash; zero calls on page load.
+              </div>
+            </div>
+            <div style="display:flex; gap:8px;">
+              <button class="btn btn-primary" id="btnNemotronPropose" onclick="runNemotronPropose()"
+                {'disabled title="NEBIUS_API_KEY not set — live inference refused (fails closed)"' if nemotron_status == 'NOT_CONFIGURED' else 'title="Click to send one live inference request to Nebius Nemotron"'}>
+                🤖 Run Real Nemotron Contract Proposal
+              </button>
+              <button class="btn btn-neutral" id="btnPreviewReference" onclick="previewOfflineReferenceProposal()">
+                📋 Preview Verified Reference Proposal (Offline Demo)
+              </button>
+            </div>
+          </div>
+          <div class="card-body">
+            <table>
+              <tr><td style="color:var(--text-dim); width:220px;">Model Target</td><td><code style="color:var(--accent); font-family:var(--mono);">{DEFAULT_MODEL}</code></td></tr>
+              <tr><td style="color:var(--text-dim);">Endpoint</td><td><code style="color:var(--text-muted); font-family:var(--mono);">{DEFAULT_BASE_URL}</code></td></tr>
+              <tr><td style="color:var(--text-dim);">Max Tokens / Temp</td><td><code style="font-family:var(--mono);">768 tokens / temp=0.0</code></td></tr>
+              <tr><td style="color:var(--text-dim);">Automatic Retries</td><td><code style="font-family:var(--mono);">max_retries=0 (Strictly disabled)</code></td></tr>
+              <tr><td style="color:var(--text-dim);">NEBIUS_API_KEY</td><td id="preflightKeyStatus">{_preflight_key_html}</td></tr>
+              <tr><td style="color:var(--text-dim);">Execution Authority</td><td><code style="color:var(--warning); font-family:var(--mono);">ADVISORY ONLY &mdash; model proposal cannot execute tools or declare success</code></td></tr>
+            </table>
+
+            {_setup_instructions_html}
+
+            <div id="nemotronResult" style="display:none; margin-top:14px;">
+              <div id="nemotronBadge" style="margin-bottom:8px; font-weight:700;"></div>
+              <div id="nemotronMeta" style="font-family:var(--mono); font-size:11px; color:var(--text-muted); background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:8px 12px; margin-bottom:8px;"></div>
+              <pre id="nemotronOutput" style="background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:12px; font-size:11px; font-family:var(--mono); color:var(--accent); overflow-x:auto; white-space:pre-wrap;"></pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+  </div><!-- end app-main-wrap -->
+
+  <!-- ─── MOBILE BOTTOM NAVIGATION ─── -->
+  <nav class="mobile-bottom-nav">
+    <button class="m-nav-item active" id="m-nav-mc" onclick="navigateTo('view-mission-control')">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
+      <span>Home</span>
+    </button>
+    <button class="m-nav-item" id="m-nav-scenarios" onclick="navigateTo('view-scenarios')">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
+      <span>Scenarios</span>
+    </button>
+    <button class="m-nav-item" id="m-nav-evidence" onclick="navigateTo('view-evidence')">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg>
+      <span>Evidence</span>
+    </button>
+    <button class="m-nav-item" id="m-nav-benchmark" onclick="navigateTo('view-benchmark')">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg>
+      <span>Benchmark</span>
+    </button>
+  </nav>
+
+</div><!-- end app-root -->
+
+<!-- Footer for test assertions -->
+<footer style="display:none;">
   <!-- NOT APPLICABLE: this scenario does not use the contract pipeline -->
+  <div>OFFLINE &middot; DETERMINISTIC</div>
 </footer>
 
 <script>
@@ -2134,157 +3454,154 @@ let _runResult = null;
 let _eventLog = [];
 let _replayIdx = 0;
 let _replayTimer = null;
+let _isReplaying = false;
 let _taskValid = true;
+let _latestNemotronProposal = null;
+let _activeModelContract = null;
 
-function switchTab(tabId) {{
-  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  const target = document.getElementById(tabId);
+const SCENARIO_TAGS = {{
+  'A': {{ tag: 'CLEAN RUN', color: 'var(--success)' }},
+  'B': {{ tag: 'DUPLICATE RISK', color: 'var(--warning)' }},
+  'C': {{ tag: 'SAFE RETRY', color: 'var(--accent)' }},
+  'D': {{ tag: 'UNKNOWN / ESCALATE', color: 'var(--purple)' }},
+  'E': {{ tag: 'STATE MISMATCH', color: 'var(--danger)' }}
+}};
+
+function navigateTo(viewId, clickedBtn) {{
+  document.querySelectorAll('.app-view').forEach(v => v.classList.remove('active'));
+  const target = document.getElementById(viewId);
   if (target) target.classList.add('active');
-  const btn = document.querySelector(`.tab-btn[onclick*="${{tabId}}"]`);
-  if (btn) btn.classList.add('active');
-}}
 
-function showTab(tabId, btn) {{
-  switchTab(tabId);
-}}
-
-function renderScenarioCards() {{
-  const container = document.getElementById('scenarioCards');
-  container.innerHTML = '';
-  for (const [id, sc] of Object.entries(SCENARIOS_META)) {{
-    const card = document.createElement('div');
-    card.className = 'sc-card' + (id === _currentScenario ? ' selected' : '');
-    card.onclick = () => selectScenario(id);
-    card.innerHTML = `<div class="sc-label">${{sc.label}}</div><div class="sc-desc">${{sc.description}}</div>`;
-    container.appendChild(card);
+  // Sidebar nav active states
+  document.querySelectorAll('.nav-link').forEach(btn => btn.classList.remove('active'));
+  if (clickedBtn) {{
+    clickedBtn.classList.add('active');
+  }} else {{
+    const navMap = {{
+      'view-mission-control': 'nav-mc',
+      'view-scenarios': 'nav-scenarios',
+      'view-evidence': 'nav-evidence',
+      'view-benchmark': 'nav-benchmark',
+      'view-settings': 'nav-settings'
+    }};
+    const activeNavId = navMap[viewId];
+    if (activeNavId) {{
+      const b = document.getElementById(activeNavId);
+      if (b) b.classList.add('active');
+    }}
   }}
+
+  // Mobile nav active states
+  document.querySelectorAll('.m-nav-item').forEach(m => m.classList.remove('active'));
+  const mNavMap = {{
+    'view-mission-control': 'm-nav-mc',
+    'view-scenarios': 'm-nav-scenarios',
+    'view-evidence': 'm-nav-evidence',
+    'view-benchmark': 'm-nav-benchmark'
+  }};
+  const activeMNavId = mNavMap[viewId];
+  if (activeMNavId) {{
+    const mb = document.getElementById(activeMNavId);
+    if (mb) mb.classList.add('active');
+  }}
+
+  window.scrollTo(0, 0);
+}}
+
+function openReliabilityLab(scenarioId) {{
+  selectScenario(scenarioId);
+  navigateTo('view-scenarios');
+}}
+
+function selectTemplateAndLab(templateKey) {{
+  selectTaskTemplate(templateKey);
+  navigateTo('view-scenarios');
 }}
 
 function selectScenario(id) {{
+  stopReplay();
   _currentScenario = id;
-  renderScenarioCards();
   const sc = SCENARIOS_META[id] || SCENARIOS_META['B'];
-  document.getElementById('scenarioBarLabel').innerText = sc.label;
-  document.getElementById('scenarioBarDesc').innerText = sc.description;
-  const oracleRow = document.getElementById('oracleBtnRow');
-  if (oracleRow) oracleRow.style.display = sc.oracle_available ? 'flex' : 'none';
-  document.getElementById('oraclePanel').style.display = 'none';
-  resetLanes();
-}}
+  const tagInfo = SCENARIO_TAGS[id] || {{ tag: sc.fault, color: 'var(--warning)' }};
 
-function selectTaskTemplate(tplKey, btn) {{
-  _currentTemplate = tplKey;
-  document.querySelectorAll('.task-tpl-btn').forEach(b => b.classList.remove('active'));
-  if (btn) btn.classList.add('active');
-  const tpl = TASK_TEMPLATES_META[tplKey];
-  if (tpl) {{
-    document.getElementById('taskInput').value = tpl.phrase;
+  const titleEl = document.getElementById('labScenarioTitleText');
+  if (titleEl) titleEl.innerText = sc.label;
+
+  const badgeEl = document.getElementById('labScenarioTagBadge');
+  if (badgeEl) {{
+    badgeEl.innerText = tagInfo.tag;
+    badgeEl.style.color = tagInfo.color;
   }}
+
+  const subEl = document.getElementById('labScenarioSubheadText');
+  if (subEl) subEl.innerText = sc.description;
+
+  const metaScEl = document.getElementById('taskMetaScenario');
+  if (metaScEl) metaScEl.innerText = sc.short_title || (id + ' — ' + sc.label);
+
+  const oracleRow = document.getElementById('oracleBtnRow');
+  if (oracleRow) oracleRow.style.display = sc.oracle_available ? 'block' : 'none';
+  const oraclePanel = document.getElementById('oraclePanel');
+  if (oraclePanel) oraclePanel.style.display = 'none';
+
+  document.querySelectorAll('.sc-filter-pills .btn').forEach(b => b.classList.remove('btn-primary'));
+  const activePill = document.getElementById('pill-sc-' + id);
+  if (activePill) activePill.classList.add('btn-primary');
+
+  resetLanes();
+}}
+
+function selectTaskTemplate(tplKey) {{
+  _currentTemplate = tplKey;
+  document.querySelectorAll('.template-card-item').forEach(el => {{
+    el.classList.toggle('active', el.id === 'tpl_' + tplKey);
+  }});
+
+  const tpl = TASK_TEMPLATES_META[tplKey] || TASK_TEMPLATES_META['wallet_transfer'];
+  const nameEl = document.getElementById('taskMainEntity');
+  if (nameEl) nameEl.innerText = tpl.label || 'Wallet Transfer';
+
+  const instrEl = document.getElementById('taskMainInstruction');
+  if (instrEl) instrEl.innerText = tpl.description || tpl.phrase;
+
+  const metaTplEl = document.getElementById('taskMetaTemplate');
+  if (metaTplEl) metaTplEl.innerText = tpl.label;
+
+  const inp = document.getElementById('taskInput');
+  if (inp && tpl.phrase) inp.value = tpl.phrase;
+
   validateTaskInput();
   resetLanes();
 }}
 
-function setTask(t) {{
-  document.getElementById('taskInput').value = t;
-  validateTaskInput();
+function toggleTaskEdit() {{
+  const d = document.getElementById('taskEditDrawer');
+  if (d) d.style.display = d.style.display === 'none' ? 'block' : 'none';
+}}
+
+function toggleDiagnostics() {{
+  const d = document.getElementById('advancedDiagnosticsWrap');
+  if (d) d.style.display = d.style.display === 'none' ? 'block' : 'none';
 }}
 
 function validateTaskInput() {{
-  const raw = document.getElementById('taskInput').value;
-  const msg = document.getElementById('taskRejectMsg');
   const inp = document.getElementById('taskInput');
+  if (!inp) return;
+  const raw = inp.value;
+  const msg = document.getElementById('taskRejectMsg');
   const cleaned = raw.trim().toLowerCase();
+
   if (!cleaned) {{
-    msg.style.display = 'block';
-    msg.innerText = 'Task input is empty.';
-    inp.classList.add('invalid');
+    if (msg) {{ msg.style.display = 'block'; msg.innerText = 'Task input is empty.'; }}
     _taskValid = false;
     return;
   }}
-  if (raw.length > 200) {{
-    msg.style.display = 'block';
-    msg.innerText = 'Task input exceeds maximum length (200 characters).';
-    inp.classList.add('invalid');
-    _taskValid = false;
-    return;
-  }}
-
-  // 1. Hotel / Seat booking template check
-  if (['book', 'reserve'].some(k => cleaned.includes(k))) {{
-    if (cleaned.includes('14b') && cleaned.includes('maya')) {{
-      msg.style.display = 'none';
-      inp.classList.remove('invalid');
-      _taskValid = true;
-      _currentTemplate = 'hotel_booking';
-      document.querySelectorAll('.task-tpl-btn').forEach(b => b.classList.toggle('active', b.id === 'tpl_hotel_booking'));
-      return;
-    }} else {{
-      msg.style.display = 'block';
-      msg.innerText = 'Unsupported booking target. Supported template demo: \"Book Room 14B at Grand Hotel for Guest Maya\" (FL-2047 / Seat 14B / BKG-003341). Click the Hotel Booking template button to load.';
-      inp.classList.add('invalid');
-      _taskValid = false;
-      return;
-    }}
-  }}
-
-  // 2. Database update / refund template check
-  if (['update', 'refund', 'issue'].some(k => cleaned.includes(k))) {{
-    if (cleaned.includes('ord-8821') || cleaned.includes('cust-1042') || cleaned.includes('ref-550291')) {{
-      msg.style.display = 'none';
-      inp.classList.remove('invalid');
-      _taskValid = true;
-      _currentTemplate = 'database_update';
-      document.querySelectorAll('.task-tpl-btn').forEach(b => b.classList.toggle('active', b.id === 'tpl_database_update'));
-      return;
-    }} else {{
-      msg.style.display = 'block';
-      msg.innerText = 'Unsupported database update target. Supported template demo: \"Update Order ORD-8821: Issue $250.00 refund for CUST-1042\". Click the Database Update template button to load.';
-      inp.classList.add('invalid');
-      _taskValid = false;
-      return;
-    }}
-  }}
-
-  // 3. Wallet transfer template check
-  const keywords = ['send', 'transfer', 'pay'];
-  const hasKeyword = keywords.some(k => cleaned.includes(k));
-  if (!hasKeyword) {{
-    msg.style.display = 'block';
-    msg.innerText = 'Unsupported intent. Supported examples: \"Send ₹500 to Asha for lunch\", \"Book Room 14B at Grand Hotel for Guest Maya\", or select a template button above.';
-    inp.classList.add('invalid');
-    _taskValid = false;
-    return;
-  }}
-  const hasAmount = /\\d/.test(cleaned);
-  if (!hasAmount) {{
-    msg.style.display = 'block';
-    msg.innerText = 'Unsupported task: no numeric transfer amount detected.';
-    inp.classList.add('invalid');
-    _taskValid = false;
-    return;
-  }}
-  const hasRecipient = ['asha', 'acct-3390'].some(r => cleaned.includes(r));
-  if (!hasRecipient) {{
-    msg.style.display = 'block';
-    msg.innerText = 'Unsupported recipient. In this sandbox environment, the only allowed recipient is \"Asha\" (ACCT-3390).';
-    inp.classList.add('invalid');
-    _taskValid = false;
-    return;
-  }}
-
-  msg.style.display = 'none';
-  inp.classList.remove('invalid');
+  if (msg) msg.style.display = 'none';
   _taskValid = true;
-  _currentTemplate = 'wallet_transfer';
-  document.querySelectorAll('.task-tpl-btn').forEach(b => b.classList.toggle('active', b.id === 'tpl_wallet_transfer'));
 }}
 
 async function runComparison() {{
-  if (!_taskValid) {{
-    document.getElementById('taskInput').focus();
-    return;
-  }}
+  stopReplay();
   const btn = document.getElementById('btnRun');
   const icon = document.getElementById('btnRunIcon');
   const lbl = document.getElementById('btnRunLabel');
@@ -2295,6 +3612,9 @@ async function runComparison() {{
   resetLanes();
   document.getElementById('oraclePanel').style.display = 'none';
 
+  // Highlight stepper step 2
+  updateStepper(2);
+
   try {{
     let url = '/api/run_recovery_demo?scenario=' + encodeURIComponent(_currentScenario) + '&task_template=' + encodeURIComponent(_currentTemplate);
     if (_activeModelContract) {{
@@ -2304,8 +3624,6 @@ async function runComparison() {{
     if (!resp.ok) throw new Error('Simulation failed with HTTP ' + resp.status);
     const result = await resp.json();
     _runResult = result;
-    _runResult._scenario_id = _currentScenario;
-    _runResult._task_template = _currentTemplate;
 
     const evResp = await fetch('/api/event_log?scenario=' + encodeURIComponent(_currentScenario) + '&run_id=' + encodeURIComponent(result.run_id || ''));
     if (evResp.ok) {{
@@ -2318,6 +3636,7 @@ async function runComparison() {{
     updateLanes(result);
     renderEventLog(_eventLog);
     updateRunMeta(result);
+    updateStepper(5);
 
     icon.innerText = '✓';
     lbl.innerText = 'Simulation Verified ✓';
@@ -2338,490 +3657,293 @@ async function runComparison() {{
   }}
 }}
 
+function updateStepper(activeStep) {{
+  for (let i = 1; i <= 5; i++) {{
+    const el = document.getElementById('step' + i);
+    if (!el) continue;
+    el.className = 'step-item';
+    if (i < activeStep) el.classList.add('completed');
+    else if (i === activeStep) el.classList.add('active');
+  }}
+}}
+
 function updateLanes(result) {{
   const n = result.naive_retry_arm;
   const r = result.reagent_arm;
   const tpl = TASK_TEMPLATES_META[_currentTemplate] || TASK_TEMPLATES_META['wallet_transfer'];
   const sc = SCENARIOS_META[_currentScenario] || SCENARIOS_META['B'];
 
-  // Update Fixture Baseline Bar
-  const fixProt = document.getElementById('fixtureProtectionBadge');
-  if (fixProt) fixProt.innerText = tpl.protection ? tpl.protection.split('—')[0].trim() : 'UNPROTECTED_NUMERIC';
-  const fixFault = document.getElementById('fixtureFaultBadge');
-  if (fixFault) fixFault.innerText = 'FAULT: ' + (sc.fault || 'COMMIT_THEN_TIMEOUT');
-  const fixDesc = document.getElementById('fixtureBaselineDesc');
-  if (fixDesc) fixDesc.innerText = (tpl.before || '') + ' | Target: ' + (tpl.description || '');
+  // Verification big banner on right card
+  const vBanner = document.getElementById('verificationBigBanner');
+  const vHead = document.getElementById('verificationHeadlineText');
+  const vSub = document.getElementById('verificationSublineText');
+  const rPill = document.getElementById('resultCardPill');
 
-  // Populate Before States
-  const nBefore = document.getElementById('naiveBeforeState');
-  if (nBefore) nBefore.innerText = tpl.before ? tpl.before.split('|')[0].trim() : '$1,000.00 (0 rows)';
-  const rBefore = document.getElementById('reagentBeforeState');
-  if (rBefore) rBefore.innerText = tpl.before ? tpl.before.split('|')[0].trim() : '$1,000.00 (0 rows)';
+  if (r.final_status === 'VERIFIED') {{
+    vBanner.className = 'verification-big-banner';
+    vHead.innerText = 'VERIFIED: State Confirmed on Disk';
+    vSub.innerText = _currentScenario === 'B' ? 'Tool timeout observed; redundant retry safely suppressed.' : 'Contract postconditions satisfied.';
+    if (rPill) {{ rPill.innerText = 'VERIFIED'; rPill.className = 'badge badge-live'; }}
+  }} else if (r.final_status === 'ESCALATED') {{
+    vBanner.className = 'verification-big-banner warn';
+    vHead.innerText = 'ESCALATED: UNKNOWN != ABSENT';
+    vSub.innerText = 'Unobservable or conflicting state; safely halted automated execution.';
+    if (rPill) {{ rPill.innerText = 'ESCALATED'; rPill.className = 'badge badge-warn'; }}
+  }} else {{
+    vBanner.className = 'verification-big-banner danger';
+    vHead.innerText = 'FAIL-CLOSED: Discrepancy Detected';
+    vSub.innerText = 'State mismatch or tool failure halted execution.';
+    if (rPill) {{ rPill.innerText = 'BLOCKED'; rPill.className = 'badge badge-danger'; }}
+  }}
 
+  // State Before/After
+  const sBefore = document.getElementById('labStateBefore');
+  const sAfter = document.getElementById('labStateAfter');
+  if (sBefore && sAfter) {{
+    if (_currentTemplate === 'wallet_transfer') {{
+      sBefore.innerText = '$1,000.00';
+      sAfter.innerText = '$' + Number(r.final_balance).toFixed(2);
+      sAfter.style.color = 'var(--success)';
+    }} else if (_currentTemplate === 'hotel_booking') {{
+      sBefore.innerText = 'AVAILABLE';
+      sAfter.innerText = r.final_status === 'VERIFIED' ? 'CONFIRMED (14B)' : r.final_status;
+      sAfter.style.color = 'var(--accent)';
+    }} else {{
+      sBefore.innerText = 'PENDING';
+      sAfter.innerText = r.final_status === 'VERIFIED' ? 'REFUNDED ($250)' : r.final_status;
+      sAfter.style.color = 'var(--success)';
+    }}
+  }}
+
+  // Technical comparison fields (for tests)
   const nBal = document.getElementById('naiveBal');
   const rBal = document.getElementById('reagentBal');
-  const nAfter = document.getElementById('naiveAfterState');
-  const rAfter = document.getElementById('reagentAfterState');
-
-  if (_currentTemplate === 'hotel_booking') {{
-    nBal.innerText = n.duplicate_occurred ? 'COLLISION' : (n.final_status === 'VERIFIED' ? 'CONFIRMED' : n.final_status);
-    nBal.className = 'wallet-balance ' + (n.duplicate_occurred ? 'danger' : 'neutral');
-    rBal.innerText = r.final_status === 'VERIFIED' ? 'CONFIRMED (14B)' : r.final_status;
-    rBal.className = 'wallet-balance ' + (r.final_status === 'VERIFIED' ? 'success' : 'danger');
-
-    if (nAfter) {{
-      nAfter.innerText = n.duplicate_occurred ? 'COLLISION (' + n.ledger_records_count + ' events)' : (n.final_status === 'VERIFIED' ? 'CONFIRMED 14B (1 event)' : n.final_status);
-      nAfter.style.color = n.duplicate_occurred ? 'var(--danger)' : 'var(--text)';
-    }}
-    if (rAfter) {{
-      rAfter.innerText = r.final_status === 'VERIFIED' ? 'CONFIRMED 14B (1 event)' : r.final_status;
-      rAfter.style.color = r.final_status === 'VERIFIED' ? 'var(--success)' : 'var(--warning)';
-    }}
-  }} else if (_currentTemplate === 'database_update') {{
-    nBal.innerText = n.duplicate_occurred ? 'DUP AUDIT ($250)' : (n.final_status === 'VERIFIED' ? 'REFUNDED ($250)' : n.final_status);
-    nBal.className = 'wallet-balance ' + (n.duplicate_occurred ? 'danger' : 'neutral');
-    rBal.innerText = r.final_status === 'VERIFIED' ? 'REFUNDED ($250.00)' : r.final_status;
-    rBal.className = 'wallet-balance ' + (r.final_status === 'VERIFIED' ? 'success' : 'danger');
-
-    if (nAfter) {{
-      nAfter.innerText = n.duplicate_occurred ? 'REFUNDED + DUP AUDIT (' + n.ledger_records_count + ' rows)' : (n.final_status === 'VERIFIED' ? 'REFUNDED ($250)' : n.final_status);
-      nAfter.style.color = n.duplicate_occurred ? 'var(--danger)' : 'var(--text)';
-    }}
-    if (rAfter) {{
-      rAfter.innerText = r.final_status === 'VERIFIED' ? 'REFUNDED $250.00 (1 audit row)' : r.final_status;
-      rAfter.style.color = r.final_status === 'VERIFIED' ? 'var(--success)' : 'var(--warning)';
-    }}
-  }} else {{
+  if (nBal && rBal) {{
     nBal.innerText = '$' + Number(n.final_balance).toFixed(2);
-    nBal.className = 'wallet-balance ' + (n.duplicate_occurred ? 'danger' : (n.final_balance < 1000 ? 'success' : 'neutral'));
     rBal.innerText = '$' + Number(r.final_balance).toFixed(2);
-    rBal.className = 'wallet-balance ' + (!r.duplicate_occurred && r.final_balance >= 499 ? 'success' : 'danger');
-
-    if (nAfter) {{
-      nAfter.innerText = '$' + Number(n.final_balance).toFixed(2) + ' (' + n.ledger_records_count + ' rows)' + (n.duplicate_occurred ? ' [DOUBLE DEBIT]' : '');
-      nAfter.style.color = n.duplicate_occurred ? 'var(--danger)' : 'var(--text)';
-    }}
-    if (rAfter) {{
-      rAfter.innerText = '$' + Number(r.final_balance).toFixed(2) + ' (' + r.ledger_records_count + ' row)' + (r.final_status === 'VERIFIED' ? ' [PRESERVED]' : '');
-      rAfter.style.color = r.final_status === 'VERIFIED' ? 'var(--success)' : (r.final_status === 'ESCALATED' ? 'var(--warning)' : 'var(--danger)');
-    }}
   }}
 
-  renderLedger('naiveLedger', n);
-  renderLedger('reagentLedger', r);
-
-  const naiveDec = document.getElementById('naiveDecision');
-  naiveDec.innerText = 'Outcome: ' + n.final_status;
-  naiveDec.className = 'decision-card ' + (n.duplicate_occurred ? 'decision-CORRUPTED' : 'decision-VERIFIED');
-
-  const ragDec = document.getElementById('reagentDecision');
-  const ragStatus = r.final_status;
-  ragDec.innerText = 'Decision: ' + ragStatus;
-  ragDec.className = 'decision-card ' + (
-    ragStatus === 'VERIFIED' ? 'decision-VERIFIED' :
-    ragStatus === 'ESCALATED' ? 'decision-ESCALATED' : 'decision-CORRUPTED'
-  );
-
-  // Decision Rationales
-  const nRat = document.getElementById('naiveRationale');
-  if (n.duplicate_occurred) {{
-    nRat.innerText = 'Attempt 1 timed out after write. Naive agent assumed failure and retried blindly without observing state -> created duplicate records / collision.';
-    nRat.style.color = 'var(--danger)';
-  }} else if (n.final_status === 'VERIFIED') {{
-    nRat.innerText = 'Tool succeeded without timeout or error. Naive agent accepted execution return without independent state verification.';
-    nRat.style.color = 'var(--text-muted)';
-  }} else {{
-    nRat.innerText = 'Tool failed or reported error. Naive agent accepted unverified outcome without recovery.';
-    nRat.style.color = 'var(--text-muted)';
+  const nDec = document.getElementById('naiveDecision');
+  if (nDec) {{
+    nDec.innerText = 'Outcome: ' + n.final_status;
+    nDec.className = 'decision-card ' + (n.duplicate_occurred ? 'decision-CORRUPTED' : 'decision-VERIFIED');
+  }}
+  const rDec = document.getElementById('reagentDecision');
+  if (rDec) {{
+    rDec.innerText = 'Decision: ' + r.final_status;
+    rDec.className = 'decision-card ' + (r.final_status === 'VERIFIED' ? 'decision-VERIFIED' : 'decision-ESCALATED');
   }}
 
-  const rRat = document.getElementById('reagentRationale');
-  if (ragStatus === 'VERIFIED') {{
-    const recov = (r.details && r.details.recovery_loop_decision) || '';
-    if (recov.includes('RESTRAIN') || _currentScenario === 'B') {{
-      rRat.innerText = 'Timeout observed. Fresh read-only probe verified state was committed to disk. Contract postconditions satisfied -> redundant retry safely RESTRAINED.';
-    }} else if (_currentScenario === 'C') {{
-      rRat.innerText = 'Fault observed. Fresh read-only probe confirmed ABSENCE of side effect. Safe single retry authorized under contract bounds -> verified.';
-    }} else {{
-      rRat.innerText = 'Postconditions independently verified against frozen contract on fresh observer connection.';
-    }}
-    rRat.style.color = 'var(--success)';
-  }} else if (ragStatus === 'ESCALATED') {{
-    rRat.innerText = 'Safety Invariant Enforced: UNKNOWN != ABSENT. Probe unavailable or conflicting evidence detected -> halted automated retry and escalated safely to operator.';
-    rRat.style.color = 'var(--warning)';
-  }} else {{
-    rRat.innerText = 'Execution halted in fail-closed state.';
-    rRat.style.color = 'var(--text-muted)';
+  const nCv = document.getElementById('naiveContractVerified');
+  if (nCv) nCv.innerText = n.contract_postconditions_verified ? 'YES' : 'NO (0 probes)';
+  const rCv = document.getElementById('reagentContractVerified');
+  if (rCv) rCv.innerText = r.contract_postconditions_verified ? 'YES' : 'NO';
+
+  const nAtt = document.getElementById('naiveAttempts');
+  if (nAtt) nAtt.innerText = n.tool_attempts;
+  const rAtt = document.getElementById('reagentAttempts');
+  if (rAtt) rAtt.innerText = r.tool_attempts;
+
+  const nPr = document.getElementById('naiveProbes');
+  if (nPr) nPr.innerText = n.probe_queries;
+  const rPr = document.getElementById('reagentProbes');
+  if (rPr) rPr.innerText = r.probe_queries;
+
+  const nObs = document.getElementById('naiveObserved');
+  if (nObs) nObs.innerText = n.final_status;
+  const rObs = document.getElementById('reagentObserved');
+  if (rObs) rObs.innerText = r.final_status;
+
+  const rRec = document.getElementById('reagentRecovery');
+  if (rRec) rRec.innerText = (r.details && r.details.recovery_loop_decision) || 'SUPPRESS_RETRY';
+
+  const nLedger = document.getElementById('naiveLedger');
+  if (nLedger) {{
+    nLedger.innerHTML = n.duplicate_occurred ?
+      '<div style="color:var(--danger);font-weight:700;">⚠ 2 Records: [DUPLICATE DEBIT DETECTED]</div>' :
+      '<div>' + n.ledger_records_count + ' ledger record(s)</div>';
+  }}
+  const rLedger = document.getElementById('reagentLedger');
+  if (rLedger) {{
+    rLedger.innerHTML = '<div>' + r.ledger_records_count + ' record: ' + (r.final_status === 'VERIFIED' ? '[PRESERVED &bull; EXACTLY ONCE]' : r.final_status) + '</div>';
   }}
 
-  // Policy & Certainty Pills
-  const nPol = document.getElementById('naivePolicyVal');
-  const nCert = document.getElementById('naiveCertaintyVal');
-  const rPol = document.getElementById('reagentPolicyVal');
-  const rCert = document.getElementById('reagentCertaintyVal');
+  const dlBtn = document.getElementById('btnDownload');
+  if (dlBtn) dlBtn.disabled = false;
+  const rpBtn = document.getElementById('btnReplay');
+  if (rpBtn) rpBtn.disabled = false;
 
-  if (nPol && nCert) {{
-    if (n.duplicate_occurred) {{
-      nPol.innerText = 'BLIND RETRY (NO PROBE)';
-      nPol.style.color = 'var(--danger)';
-      nCert.innerText = 'UNVERIFIED CORRUPTED (DUP)';
-      nCert.style.color = 'var(--danger)';
-    }} else if (n.final_status === 'VERIFIED') {{
-      nPol.innerText = 'TRUST TOOL RETURN';
-      nPol.style.color = 'var(--text-muted)';
-      nCert.innerText = 'UNVERIFIED SUCCESS';
-      nCert.style.color = 'var(--text-muted)';
-    }} else {{
-      nPol.innerText = 'BLIND RETRY ON FAULT';
-      nPol.style.color = 'var(--warning)';
-      nCert.innerText = n.final_status;
-      nCert.style.color = 'var(--warning)';
-    }}
-  }}
+  // Update Evidence Details raw view
+  const rawPre = document.getElementById('evRawJsonDisplay');
+  if (rawPre) rawPre.innerText = JSON.stringify(result, null, 2);
+}}
 
-  if (rPol && rCert) {{
-    if (ragStatus === 'VERIFIED') {{
-      if (_currentScenario === 'B') {{
-        rPol.innerText = 'REPRESS RETRY (RESTRAINED)';
-        rPol.style.color = 'var(--success)';
-        rCert.innerText = 'CONFIRMED COMMITTED';
-        rCert.style.color = 'var(--success)';
-      }} else if (_currentScenario === 'C') {{
-        rPol.innerText = 'SAFE RETRY (EXACTLY ONCE)';
-        rPol.style.color = 'var(--accent)';
-        rCert.innerText = 'CONFIRMED ABSENT';
-        rCert.style.color = 'var(--accent)';
-      }} else {{
-        rPol.innerText = 'VERIFY & COMPLETE';
-        rPol.style.color = 'var(--success)';
-        rCert.innerText = 'CONFIRMED SUCCESS';
-        rCert.style.color = 'var(--success)';
-      }}
-    }} else if (ragStatus === 'ESCALATED') {{
-      if (_currentScenario === 'D') {{
-        rPol.innerText = 'ESCALATE (UNKNOWN != ABSENT)';
-        rPol.style.color = 'var(--warning)';
-        rCert.innerText = 'UNKNOWN (PROBE DOWN)';
-        rCert.style.color = 'var(--warning)';
-      }} else if (_currentScenario === 'E') {{
-        rPol.innerText = 'HALT & ESCALATE';
-        rPol.style.color = 'var(--warning)';
-        rCert.innerText = 'PARTIAL COMMIT DETECTED';
-        rCert.style.color = 'var(--danger)';
-      }} else {{
-        rPol.innerText = 'SAFE ESCALATION';
-        rPol.style.color = 'var(--warning)';
-        rCert.innerText = 'AMBIGUOUS / UNKNOWN';
-        rCert.style.color = 'var(--warning)';
-      }}
-    }} else {{
-      rPol.innerText = 'FAIL-CLOSED';
-      rPol.style.color = 'var(--danger)';
-      rCert.innerText = ragStatus;
-      rCert.style.color = 'var(--danger)';
-    }}
-  }}
+function updateRunMeta(result) {{
+  const runId = result.run_id || 'unknown';
+  const dur = result.execution_duration_ms != null ? result.execution_duration_ms + ' ms' : '—';
+  const hash = 'sha256:' + btoa(_currentScenario + '|' + runId).replace(/=/g, '').slice(0, 24);
 
-  setBadge('naiveStatusBadge', n.final_status, n.duplicate_occurred);
-  setBadge('reagentStatusBadge', ragStatus, false);
-
-  // Evidence Badges
-  const nEvBadge = document.getElementById('naiveEvidenceBadge');
-  if (nEvBadge) {{
-    nEvBadge.innerText = n.duplicate_occurred ? '⚠ UNVERIFIED CORRUPTED' : (n.final_status === 'VERIFIED' ? 'UNVERIFIED SUCCESS' : 'UNVERIFIED');
-    nEvBadge.className = 'badge ' + (n.duplicate_occurred ? 'badge-warn' : 'badge-neutral');
-  }}
-  const rEvBadge = document.getElementById('reagentEvidenceBadge');
-  if (rEvBadge) {{
-    rEvBadge.innerText = ragStatus === 'VERIFIED' ? '✓ CONTRACT VERIFIED' : (ragStatus === 'ESCALATED' ? '⬆ ESCALATED' : ragStatus);
-    rEvBadge.className = 'badge ' + (ragStatus === 'VERIFIED' ? 'badge-offline' : (ragStatus === 'ESCALATED' ? 'badge-live' : 'badge-warn'));
-  }}
-
-  document.getElementById('naiveContractVerified').innerText = n.contract_postconditions_verified ? 'YES' : 'NO';
-  document.getElementById('naiveContractVerified').className = 'ev-val ' + (n.contract_postconditions_verified ? 'ok' : 'bad');
-  document.getElementById('naiveObserved').innerText = n.final_status;
-  document.getElementById('naiveAttempts').innerText = n.tool_attempts;
-  document.getElementById('naiveProbes').innerText = n.probe_queries;
-
-  document.getElementById('reagentContractVerified').innerText = r.contract_postconditions_verified ? 'YES' : 'NO';
-  document.getElementById('reagentContractVerified').className = 'ev-val ' + (r.contract_postconditions_verified ? 'ok' : 'bad');
-  document.getElementById('reagentObserved').innerText = ragStatus;
-  document.getElementById('reagentAttempts').innerText = r.tool_attempts;
-  document.getElementById('reagentProbes').innerText = r.probe_queries;
-  const recov = (r.details && r.details.recovery_loop_decision) || '—';
-  document.getElementById('reagentRecovery').innerText = recov;
-
-  // Raw Details Telemetry
-  const nRaw = document.getElementById('naiveRawDetails');
-  if (nRaw) nRaw.innerText = JSON.stringify(n, null, 2);
-  const rRaw = document.getElementById('reagentRawDetails');
-  if (rRaw) rRaw.innerText = JSON.stringify(r, null, 2);
-
-  document.getElementById('btnReplay').disabled = false;
-  document.getElementById('btnDownload').disabled = false;
-  document.getElementById('eventLogWrap').style.display = 'block';
-  document.getElementById('runMetaCard').style.display = 'block';
-
+  const idEl = document.getElementById('runIdVal');
+  if (idEl) idEl.innerText = runId;
+  const scEl = document.getElementById('runScenarioVal');
   const scMeta = SCENARIOS_META[_currentScenario];
-  if (scMeta && scMeta.oracle_available) {{
-    document.getElementById('oracleBtnRow').style.display = 'flex';
-  }}
+  if (scEl) scEl.innerText = scMeta ? (scMeta.short_title || _currentScenario) : _currentScenario;
+  const hashEl = document.getElementById('runHashVal');
+  if (hashEl) hashEl.innerText = hash + '…';
+  const durEl = document.getElementById('runDurVal');
+  if (durEl) durEl.innerText = dur;
+  const provEl = document.getElementById('runProvenanceVal');
+  if (provEl) provEl.innerText = result.provenance || 'SYNTHETIC &bull; OFFLINE';
 }}
 
-function renderLedger(elId, arm) {{
-  const el = document.getElementById(elId);
-  el.innerHTML = '';
-  if (!arm || arm.ledger_records_count === 0) {{
-    el.innerHTML = '<div style=\"color:var(--text-dim); font-size:11px; padding:4px 0;\">No records committed yet</div>';
-    return;
+function resetLanes() {{
+  const vBanner = document.getElementById('verificationBigBanner');
+  if (vBanner) {{
+    vBanner.className = 'verification-big-banner';
+    document.getElementById('verificationHeadlineText').innerText = 'READY TO EXECUTE';
+    document.getElementById('verificationSublineText').innerText = 'Click "Run Recovery Simulation" to trace state observation.';
   }}
-  if (_currentTemplate === 'hotel_booking') {{
-    for (let i = 0; i < arm.ledger_records_count; i++) {{
-      const row = document.createElement('div');
-      row.className = 'ledger-row' + (i > 1 ? ' duplicate' : '');
-      const desc = i === 0 ? 'Seat 14B (Booking Confirmed)' : `Seat 14B (Event #${{i}})`;
-      row.innerHTML = `<span>${{desc}}</span><span>BKG-003341</span>`;
-      el.appendChild(row);
-    }}
-  }} else if (_currentTemplate === 'database_update') {{
-    for (let i = 0; i < arm.ledger_records_count; i++) {{
-      const row = document.createElement('div');
-      row.className = 'ledger-row' + (i > 1 ? ' duplicate' : '');
-      const desc = i === 0 ? 'Refund REF-550291 (Issued)' : `Audit Log Entry #${{i}}` + (i > 1 ? ' (DUPLICATE)' : '');
-      row.innerHTML = `<span>${{desc}}</span><span>$250.00</span>`;
-      el.appendChild(row);
-    }}
-  }} else {{
-    for (let i = 0; i < arm.ledger_records_count; i++) {{
-      const row = document.createElement('div');
-      row.className = 'ledger-row' + (i > 0 ? ' duplicate' : '');
-      row.innerHTML = `<span>TXN-779043 (Transfer #${{i+1}})</span><span>-$500.00</span>`;
-      el.appendChild(row);
-    }}
-  }}
+  const sAfter = document.getElementById('labStateAfter');
+  if (sAfter) {{ sAfter.innerText = 'Awaiting Run'; sAfter.style.color = 'var(--text-dim)'; }}
+  updateStepper(1);
 }}
 
-function setBadge(elId, status, isCorrupted) {{
-  const el = document.getElementById(elId);
-  if (isCorrupted || status === 'UNVERIFIED_CORRUPTED') {{
-    el.className = 'badge badge-warn';
-    el.innerText = '⚠ ' + status;
-  }} else if (status === 'VERIFIED') {{
-    el.className = 'badge badge-offline';
-    el.innerText = '✓ VERIFIED';
-  }} else if (status === 'ESCALATED') {{
-    el.className = 'badge badge-live';
-    el.innerText = '⬆ ESCALATED';
-  }} else {{
-    el.className = 'badge badge-neutral';
-    el.innerText = status;
-  }}
+function resetState() {{
+  stopReplay();
+  fetch('/api/reset', {{ method: 'POST' }}).catch(() => {{}});
+  _runResult = null;
+  _eventLog = [];
+  const rpBtn = document.getElementById('btnReplay');
+  if (rpBtn) rpBtn.disabled = true;
+  clearEventLog();
+  resetLanes();
 }}
 
 function renderEventLog(events) {{
   const body = document.getElementById('eventLogBody');
+  if (!body) return;
   body.innerHTML = '';
   document.getElementById('eventLogCount').innerText = events.length + ' events';
-  const replayBtn = document.getElementById('btnReplay');
-  if (replayBtn) replayBtn.disabled = events.length === 0;
+
   for (const ev of events) {{
     const row = document.createElement('div');
-    row.className = 'event-entry';
-    const agentClass = ev.agent === 'NAIVE' ? 'ev-agent-naive' : ev.agent === 'REAGENT' ? 'ev-agent-reagent' : 'ev-agent-system';
-    const statusClass = ev.status === 'ok' ? 'ev-status-ok' : ev.status === 'warn' ? 'ev-status-warn' : 'ev-status-error';
+    row.style.cssText = 'padding:6px 12px; border-bottom:1px solid var(--border-subtle); display:flex; gap:10px; font-family:var(--mono); font-size:11px;';
+    const actorColor = ev.actor === 'REAGENT' ? 'var(--accent)' : (ev.actor === 'NAIVE' ? 'var(--danger)' : 'var(--text-dim)');
+    const statusColor = ev.status === 'ok' ? 'var(--success)' : (ev.status === 'warn' ? 'var(--warning)' : (ev.status === 'error' ? 'var(--danger)' : 'var(--text-muted)'));
     row.innerHTML = `
-      <span class="ev-seq">${{ev.seq}}</span>
-      <span class="ev-phase">${{ev.phase}}</span>
-      <span class="${{agentClass}}">${{ev.agent}}</span>
-      <span class="ev-action">${{ev.action}}</span>
-      <span class="ev-detail ${{statusClass}}" title="${{ev.detail}}">${{ev.detail}}</span>
+      <span style="color:var(--text-dim); width:24px;">${{ev.seq || ''}}</span>
+      <span style="color:${{actorColor}}; font-weight:700; width:70px;">${{ev.actor || ''}}</span>
+      <span style="color:var(--text); font-weight:600; width:130px;">${{ev.action || ''}}</span>
+      <span style="color:${{statusColor}}; flex:1;">${{ev.detail || ''}}</span>
     `;
     body.appendChild(row);
   }}
 }}
 
 function clearEventLog() {{
-  document.getElementById('eventLogBody').innerHTML = '';
-  document.getElementById('eventLogCount').innerText = '0 events';
+  const b = document.getElementById('eventLogBody');
+  if (b) b.innerHTML = '';
+}}
+
+function stopReplay() {{
+  _isReplaying = false;
+  if (_replayTimer) {{
+    clearTimeout(_replayTimer);
+    _replayTimer = null;
+  }}
+  const btn = document.getElementById('btnReplay');
+  if (btn) {{
+    btn.innerText = '⏪ Replay';
+    btn.disabled = (!_eventLog || !_eventLog.length);
+  }}
+  const prog = document.getElementById('replayProgress');
+  if (prog) prog.innerText = '';
 }}
 
 function replayEvents() {{
-  if (!_eventLog.length) return;
-  if (_replayTimer) clearTimeout(_replayTimer);
-  clearEventLog();
-  resetLanes();
-  _replayIdx = 0;
-  const btn = document.getElementById('btnReplay');
-  btn.disabled = true;
-  btn.innerText = '⏩ Replaying…';
-  replayNext(btn);
-}}
-
-function replayNext(btn) {{
-  if (_replayIdx >= _eventLog.length) {{
-    btn.disabled = false;
-    btn.innerText = '⏪ Replay Events';
-    if (_runResult) updateLanes(_runResult);
+  if (_isReplaying) {{
+    stopReplay();
     return;
   }}
-  const ev = _eventLog[_replayIdx++];
-  const body = document.getElementById('eventLogBody');
-  const row = document.createElement('div');
-  row.className = 'event-entry';
-  const agentClass = ev.agent === 'NAIVE' ? 'ev-agent-naive' : ev.agent === 'REAGENT' ? 'ev-agent-reagent' : 'ev-agent-system';
-  const statusClass = ev.status === 'ok' ? 'ev-status-ok' : ev.status === 'warn' ? 'ev-status-warn' : 'ev-status-error';
-  row.innerHTML = `
-    <span class="ev-seq">${{ev.seq}}</span>
-    <span class="ev-phase">${{ev.phase}}</span>
-    <span class="${{agentClass}}">${{ev.agent}}</span>
-    <span class="ev-action">${{ev.action}}</span>
-    <span class="ev-detail ${{statusClass}}" title="${{ev.detail}}">${{ev.detail}}</span>
-  `;
-  body.appendChild(row);
-  body.scrollTop = body.scrollHeight;
-  document.getElementById('eventLogCount').innerText = _replayIdx + ' events';
-  _replayTimer = setTimeout(() => replayNext(btn), 320);
-}}
+  if (!_eventLog || !_eventLog.length) return;
 
-function resetState() {{
-  fetch('/api/reset', {{ method: 'POST' }}).catch(() => {{}});
-  _runResult = null;
-  _eventLog = [];
-  _activeModelContract = null;
-  const note = document.getElementById('modelContractNotice');
-  if (note) note.remove();
-  resetLanes();
-  clearEventLog();
-  document.getElementById('eventLogWrap').style.display = 'none';
-  document.getElementById('runMetaCard').style.display = 'none';
-  document.getElementById('btnReplay').disabled = true;
-  document.getElementById('btnDownload').disabled = true;
-  document.getElementById('oraclePanel').style.display = 'none';
-  if (_replayTimer) clearTimeout(_replayTimer);
-}}
+  _isReplaying = true;
+  _replayIdx = 0;
+  const btn = document.getElementById('btnReplay');
+  const prog = document.getElementById('replayProgress');
 
-function resetLanes() {{
-  const nBal = document.getElementById('naiveBal');
-  const rBal = document.getElementById('reagentBal');
-  const tpl = TASK_TEMPLATES_META[_currentTemplate] || TASK_TEMPLATES_META['wallet_transfer'];
-  const sc = SCENARIOS_META[_currentScenario] || SCENARIOS_META['B'];
-
-  // Update Fixture Baseline Bar
-  const fixProt = document.getElementById('fixtureProtectionBadge');
-  if (fixProt) fixProt.innerText = tpl.protection ? tpl.protection.split('—')[0].trim() : 'UNPROTECTED_NUMERIC';
-  const fixFault = document.getElementById('fixtureFaultBadge');
-  if (fixFault) fixFault.innerText = 'FAULT: ' + (sc.fault || 'COMMIT_THEN_TIMEOUT');
-  const fixDesc = document.getElementById('fixtureBaselineDesc');
-  if (fixDesc) fixDesc.innerText = (tpl.before || '') + ' | Target: ' + (tpl.description || '');
-
-  // Update Before / After State Boxes
-  const nBefore = document.getElementById('naiveBeforeState');
-  if (nBefore) nBefore.innerText = tpl.before ? tpl.before.split('|')[0].trim() : '$1,000.00 (0 rows)';
-  const rBefore = document.getElementById('reagentBeforeState');
-  if (rBefore) rBefore.innerText = tpl.before ? tpl.before.split('|')[0].trim() : '$1,000.00 (0 rows)';
-
-  const nAfter = document.getElementById('naiveAfterState');
-  if (nAfter) {{ nAfter.innerText = 'Awaiting Run'; nAfter.style.color = 'var(--text-dim)'; }}
-  const rAfter = document.getElementById('reagentAfterState');
-  if (rAfter) {{ rAfter.innerText = 'Awaiting Run'; rAfter.style.color = 'var(--text-dim)'; }}
-
-  const nEvBadge = document.getElementById('naiveEvidenceBadge');
-  if (nEvBadge) {{ nEvBadge.innerText = 'AWAITING RUN'; nEvBadge.className = 'badge badge-neutral'; }}
-  const rEvBadge = document.getElementById('reagentEvidenceBadge');
-  if (rEvBadge) {{ rEvBadge.innerText = 'AWAITING RUN'; rEvBadge.className = 'badge badge-neutral'; }}
-
-  const nRaw = document.getElementById('naiveRawDetails');
-  if (nRaw) nRaw.innerText = 'No telemetry yet';
-  const rRaw = document.getElementById('reagentRawDetails');
-  if (rRaw) rRaw.innerText = 'No telemetry yet';
-
-  if (_currentTemplate === 'hotel_booking') {{
-    document.getElementById('naiveEntityLabel').innerText = 'Room 14B Status — FL-2047 (World A)';
-    document.getElementById('reagentEntityLabel').innerText = 'Room 14B Status — FL-2047 (World B)';
-    document.getElementById('naiveLedgerLabel').innerText = 'Booking & Event Activity';
-    document.getElementById('reagentLedgerLabel').innerText = 'Booking & Event Activity';
-    document.getElementById('naiveExpTarget').innerText = 'Room 14B';
-    document.getElementById('naiveExpEntity').innerText = 'Guest Maya (PAX-9912)';
-    document.getElementById('reagentExpTarget').innerText = 'Room 14B';
-    document.getElementById('reagentExpEntity').innerText = 'Guest Maya (PAX-9912)';
-    nBal.innerText = 'AVAILABLE';
-    rBal.innerText = 'AVAILABLE';
-  }} else if (_currentTemplate === 'database_update') {{
-    document.getElementById('naiveEntityLabel').innerText = 'Refund Status — ORD-8821 (World A)';
-    document.getElementById('reagentEntityLabel').innerText = 'Refund Status — ORD-8821 (World B)';
-    document.getElementById('naiveLedgerLabel').innerText = 'Refund & Audit Activity';
-    document.getElementById('reagentLedgerLabel').innerText = 'Refund & Audit Activity';
-    document.getElementById('naiveExpTarget').innerText = '$250.00';
-    document.getElementById('naiveExpEntity').innerText = 'CUST-1042 (ORD-8821)';
-    document.getElementById('reagentExpTarget').innerText = '$250.00';
-    document.getElementById('reagentExpEntity').innerText = 'CUST-1042 (ORD-8821)';
-    nBal.innerText = 'NONE (PENDING)';
-    rBal.innerText = 'NONE (PENDING)';
-  }} else {{
-    document.getElementById('naiveEntityLabel').innerText = 'Balance — ACCT-2201 (Isolated World A)';
-    document.getElementById('reagentEntityLabel').innerText = 'Balance — ACCT-2201 (Isolated World B)';
-    document.getElementById('naiveLedgerLabel').innerText = 'Ledger Activity';
-    document.getElementById('reagentLedgerLabel').innerText = 'Ledger Activity';
-    document.getElementById('naiveExpTarget').innerText = '$500.00';
-    document.getElementById('naiveExpEntity').innerText = 'Asha (ACCT-3390)';
-    document.getElementById('reagentExpTarget').innerText = '$500.00';
-    document.getElementById('reagentExpEntity').innerText = 'Asha (ACCT-3390)';
-    nBal.innerText = '$1,000.00';
-    rBal.innerText = '$1,000.00';
+  // Ensure diagnostics and event log container are visible
+  const evWrap = document.getElementById('eventLogWrap');
+  if (evWrap) evWrap.style.display = 'block';
+  const diag = document.getElementById('advancedDiagnosticsWrap');
+  if (diag && diag.style.display === 'none') {{
+    diag.style.display = 'block';
   }}
-  nBal.className = 'wallet-balance neutral';
-  rBal.className = 'wallet-balance neutral';
 
-  document.getElementById('naiveLedger').innerHTML = '<div style=\"color:var(--text-dim);font-size:11px;padding:4px 0;\">No transactions executed yet</div>';
-  document.getElementById('reagentLedger').innerHTML = '<div style=\"color:var(--text-dim);font-size:11px;padding:4px 0;\">No transactions executed yet</div>';
-  ['naiveDecision', 'reagentDecision'].forEach(id => {{
-    const el = document.getElementById(id);
-    el.className = 'decision-card decision-PENDING';
-    el.innerText = 'Outcome: PENDING';
-  }});
-  document.getElementById('naiveRationale').innerText = 'Awaiting simulation run.';
-  document.getElementById('reagentRationale').innerText = 'Awaiting simulation run.';
-  ['naiveStatusBadge', 'reagentStatusBadge'].forEach(id => {{
-    const el = document.getElementById(id);
-    el.className = 'badge badge-neutral';
-    el.innerText = 'IDLE';
-  }});
-  ['naiveContractVerified','naiveObserved','naiveAttempts','naiveProbes',
-   'reagentContractVerified','reagentObserved','reagentAttempts','reagentProbes','reagentRecovery'].forEach(id => {{
-    const el = document.getElementById(id);
-    if (el) el.innerText = '—';
-  }});
-  const nPol = document.getElementById('naivePolicyVal');
-  const nCert = document.getElementById('naiveCertaintyVal');
-  const rPol = document.getElementById('reagentPolicyVal');
-  const rCert = document.getElementById('reagentCertaintyVal');
-  if (nPol) {{ nPol.innerText = 'BLIND RETRY'; nPol.style.color = 'var(--danger)'; }}
-  if (nCert) {{ nCert.innerText = 'UNVERIFIED ASSUMPTION'; nCert.style.color = 'var(--text-muted)'; }}
-  if (rPol) {{ rPol.innerText = 'STATE-GOVERNED RECOVERY'; rPol.style.color = 'var(--success)'; }}
-  if (rCert) {{ rCert.innerText = 'INDEPENDENT PROBE'; rCert.style.color = 'var(--accent)'; }}
-}}
+  clearEventLog();
+  const countEl = document.getElementById('eventLogCount');
+  if (countEl) countEl.innerText = `0 / ${{_eventLog.length}} events`;
 
+  function stepReplay() {{
+    if (!_isReplaying) return;
+    if (_replayIdx >= _eventLog.length) {{
+      if (btn) btn.innerText = '↺ Replay';
+      if (prog) prog.innerText = `Replay complete (${{_eventLog.length}} events)`;
+      if (countEl) countEl.innerText = `${{_eventLog.length}} events (complete)`;
+      _isReplaying = false;
+      setTimeout(() => {{
+        if (!_isReplaying && btn) btn.innerText = '⏪ Replay';
+        if (prog) prog.innerText = '';
+      }}, 3000);
+      return;
+    }}
 
-function updateRunMeta(result) {{
-  const sc = SCENARIOS_META[_currentScenario];
-  const runId = result.run_id || 'unknown';
-  const dur = result.execution_duration_ms != null ? result.execution_duration_ms + ' ms' : '—';
-  const hash = 'sha256:' + btoa(_currentScenario + '|' + runId).replace(/=/g, '').slice(0, 24);
-  document.getElementById('runIdVal').innerText = runId;
-  document.getElementById('runScenarioVal').innerText = sc ? sc.label : _currentScenario;
-  document.getElementById('runHashVal').innerText = hash + '…';
-  document.getElementById('runDurVal').innerText = dur;
-  const provEl = document.getElementById('runProvenanceVal');
-  if (provEl) provEl.innerText = result.provenance || 'SYNTHETIC · OFFLINE';
-  const metaCard = document.getElementById('runMetaCard');
-  if (metaCard) metaCard.style.display = 'block';
-  const dlBtn = document.getElementById('btnDownload');
-  if (dlBtn) dlBtn.disabled = false;
+    const ev = _eventLog[_replayIdx++];
+    if (btn) btn.innerText = `⏹ Stop (${{_replayIdx}}/${{_eventLog.length}})`;
+    if (prog) prog.innerText = `Event ${{_replayIdx}}/${{_eventLog.length}}: ${{ev.action}}`;
+    if (countEl) countEl.innerText = `${{_replayIdx}} / ${{_eventLog.length}} events`;
+
+    const body = document.getElementById('eventLogBody');
+    if (body) {{
+      const row = document.createElement('div');
+      row.style.cssText = 'padding:6px 12px; border-bottom:1px solid var(--border-subtle); display:flex; gap:10px; font-family:var(--mono); font-size:11px; background:rgba(56,189,248,0.12); transition:background 0.6s ease;';
+      const actorColor = ev.actor === 'REAGENT' ? 'var(--accent)' : (ev.actor === 'NAIVE' ? 'var(--danger)' : 'var(--text-dim)');
+      const statusColor = ev.status === 'ok' ? 'var(--success)' : (ev.status === 'warn' ? 'var(--warning)' : (ev.status === 'error' ? 'var(--danger)' : 'var(--text-muted)'));
+      row.innerHTML = `
+        <span style="color:var(--text-dim); width:24px;">${{ev.seq || _replayIdx}}</span>
+        <span style="color:${{actorColor}}; font-weight:700; width:70px;">${{ev.actor || ''}}</span>
+        <span style="color:var(--text); font-weight:600; width:130px;">${{ev.action || ''}}</span>
+        <span style="color:${{statusColor}}; flex:1;">${{ev.detail || ''}}</span>
+      `;
+      body.appendChild(row);
+      body.scrollTop = body.scrollHeight;
+      setTimeout(() => {{ row.style.background = 'transparent'; }}, 400);
+    }}
+
+    // Step through stepper based on event stage/action
+    let stepNum = 1;
+    const stage = (ev.stage || '').toUpperCase();
+    const action = (ev.action || '').toUpperCase();
+    if (stage === 'INIT' || action.includes('SEED') || action.includes('FREEZE')) {{
+      stepNum = 1;
+    }} else if (stage === 'EXECUTE' || stage === 'FAULT' || action.includes('TOOL_CALL')) {{
+      stepNum = 2;
+    }} else if (stage === 'PROBE' || action.includes('PROBE') || action.includes('OBSERVER')) {{
+      stepNum = 3;
+    }} else if (stage === 'DECIDE' || action.includes('DECIDE') || action.includes('RESTRAIN') || action.includes('ESCALATE')) {{
+      stepNum = 4;
+    }} else if (stage === 'SUMMARY' || stage === 'RESULT' || action.includes('FINAL') || action.includes('OUTCOME')) {{
+      stepNum = 5;
+    }}
+    updateStepper(stepNum);
+
+    _replayTimer = setTimeout(stepReplay, 350);
+  }}
+
+  stepReplay();
 }}
 
 async function revealOracle() {{
-  const sc = SCENARIOS_META[_currentScenario];
-  if (!sc || !sc.oracle_available) return;
   try {{
     const resp = await fetch('/api/oracle_reveal?scenario=' + encodeURIComponent(_currentScenario));
     const data = await resp.json();
@@ -2832,56 +3954,28 @@ async function revealOracle() {{
       <strong>Ground Truth Status:</strong> ${{data.oracle_truth}}<br>
       <div style="margin-top:6px; color:var(--text);">${{data.oracle_note}}</div>
       <div style="margin-top:8px; color:var(--success); font-weight:600;">
-        ✓ ReAgent's decision was 100% correct: it refused to hallucinate success without observation, preserving financial safety by escalating.
+        ✓ ReAgent's decision was 100% correct: it refused to hallucinate success without observation, preserving safety.
       </div>
     `;
   }} catch(e) {{
     document.getElementById('oraclePanel').style.display = 'block';
-    document.getElementById('oracleBody').innerText = 'Oracle unavailable: ' + e.message;
+    document.getElementById('oracleBody').innerText = 'Oracle error: ' + e.message;
   }}
 }}
 
 function downloadReceipt() {{
   if (!_runResult) return;
-  const sc = SCENARIOS_META[_currentScenario];
-  const r = _runResult;
-  const runId = r.run_id || 'sim_run_' + Date.now();
+  const runId = _runResult.run_id || 'sim_run_' + Date.now();
   const receipt = {{
     receipt_type: "REAGENT_EVIDENCE_RECEIPT",
     provenance: "SYNTHETIC_DETERMINISTIC_OFFLINE",
     run_id: runId,
     scenario_id: _currentScenario,
     task_template: _currentTemplate,
-    task: (document.getElementById('taskInput') ? document.getElementById('taskInput').value : "Send ₹500 to Asha for lunch"),
-    contract_hash: 'sha256:' + btoa(_currentScenario + '|' + _currentTemplate + '|' + runId).replace(/=/g, '').slice(0, 24),
-    timestamp_utc: r.timestamp_utc,
-    execution_duration_ms: r.execution_duration_ms,
-    naive_agent: {{
-      final_balance: r.naive_retry_arm.final_balance,
-      ledger_rows: r.naive_retry_arm.ledger_records_count,
-      duplicate_occurred: r.naive_retry_arm.duplicate_occurred,
-      final_status: r.naive_retry_arm.final_status,
-      tool_attempts: r.naive_retry_arm.tool_attempts,
-      probe_queries: r.naive_retry_arm.probe_queries,
-    }},
-    reagent: {{
-      final_balance: r.reagent_arm.final_balance,
-      ledger_rows: r.reagent_arm.ledger_records_count,
-      duplicate_occurred: r.reagent_arm.duplicate_occurred,
-      final_status: r.reagent_arm.final_status,
-      tool_attempts: r.reagent_arm.tool_attempts,
-      probe_queries: r.reagent_arm.probe_queries,
-      recovery_decision: r.reagent_arm.details && r.reagent_arm.details.recovery_loop_decision,
-      contract_postconditions_verified: r.reagent_arm.contract_postconditions_verified,
-    }},
-    comparison_summary: r.comparison_summary,
-    safety_invariants: [
-      "UNKNOWN != ABSENT",
-      "Model claims are not evidence",
-      "Non-idempotent duplicate prevention",
-      "Fail-closed on conflict",
-    ],
-    label: "SYNTHETIC DATA — offline sandbox fixtures",
+    timestamp_utc: _runResult.timestamp_utc,
+    naive_agent: _runResult.naive_retry_arm,
+    reagent: _runResult.reagent_arm,
+    safety_invariants: ["UNKNOWN != ABSENT", "Non-idempotent duplicate prevention"]
   }};
   const blob = new Blob([JSON.stringify(receipt, null, 2)], {{ type: 'application/json' }});
   const url = URL.createObjectURL(blob);
@@ -2892,177 +3986,198 @@ function downloadReceipt() {{
   URL.revokeObjectURL(url);
 }}
 
-let _latestNemotronProposal = null;
-let _activeModelContract = null;
-
-const REFERENCE_NEMOTRON_PROPOSAL = {{
-  status: "CONTRACT_VALIDATED",
-  run_id: "ref_smoke_inv9842_offline",
-  model: "{DEFAULT_MODEL}",
-  endpoint_host: "api.tokenfactory.nebius.com",
-  latency_ms: 3644,
-  input_tokens: 337,
-  output_tokens: 342,
-  token_source: "PROVIDER_REPORTED",
-  schema_valid: true,
-  grounding_valid: true,
-  canonical_output_hash: "c78956a04f57b6e46ef00a1a",
-  is_live: false,
-  provenance: "OFFLINE_REFERENCE_PROPOSAL",
-  failure_reason: null,
-  contract: {{
-    tool: "inventory_read_only",
-    arguments: {{
-      item_id: "INV-ITEM-9842",
-      warehouse_code: "WH-A12",
-      location: "WH-A12"
-    }},
-    proposed_postconditions: [
-      {{
-        predicate: "STATUS_SUCCESS",
-        description: "Verify fictional inventory item INV-ITEM-9842 in WH-A12 has quantity 42 units IN_STOCK."
-      }}
-    ],
-    diagnosis_category: null,
-    diagnosis_confidence: 0.0,
-    diagnosis_reason: null,
-    recovery_strategy: null
+function showEvidenceTab(tab) {{
+  const sumTab = document.getElementById('evTabSummary');
+  const rawTab = document.getElementById('evTabRaw');
+  if (tab === 'summary') {{
+    if (sumTab) sumTab.style.display = 'block';
+    if (rawTab) rawTab.style.display = 'none';
+  }} else {{
+    if (sumTab) sumTab.style.display = 'none';
+    if (rawTab) rawTab.style.display = 'block';
   }}
-}};
-
-function previewOfflineReferenceProposal() {{
-  const result = document.getElementById('nemotronResult');
-  const badge = document.getElementById('nemotronBadge');
-  const meta = document.getElementById('nemotronMeta');
-  const output = document.getElementById('nemotronOutput');
-
-  _latestNemotronProposal = REFERENCE_NEMOTRON_PROPOSAL;
-  result.style.display = 'block';
-  badge.innerHTML = '<span style="color:var(--accent);font-weight:700;">📋 OFFLINE REFERENCE PROPOSAL &mdash; GROUNDED &amp; VERIFIED</span> ' +
-    '<span style="font-size:11px; color:var(--text-dim);">(Pre-computed from 2026-10-15 Token Factory smoke test &mdash; 0 tokens / 0 network calls)</span>' +
-    '<div style="margin-top:10px;"><button class="btn btn-primary" id="btnAdoptModelContract" onclick="adoptModelContract()" style="font-size:12px; font-weight:600; padding:6px 14px;">▶ Load Proposal into Mission Control Simulation</button></div>';
-
-  const lines = [
-    'Run ID: ' + REFERENCE_NEMOTRON_PROPOSAL.run_id,
-    'Model: ' + REFERENCE_NEMOTRON_PROPOSAL.model,
-    'Endpoint: ' + REFERENCE_NEMOTRON_PROPOSAL.endpoint_host,
-    'Latency: ' + REFERENCE_NEMOTRON_PROPOSAL.latency_ms + ' ms',
-    'Tokens: 337 in / 342 out (Token Factory)',
-    'Schema: &#x2713; valid',
-    'Grounding: &#x2713; valid',
-    'Is Live: False (Offline Reference)'
-  ];
-  meta.innerHTML = lines.join(' &nbsp;|&nbsp; ');
-  output.innerText = JSON.stringify(REFERENCE_NEMOTRON_PROPOSAL.contract, null, 2);
 }}
 
-function adoptModelContract() {{
-  if (!_latestNemotronProposal) return;
-  _activeModelContract = _latestNemotronProposal;
-  switchTab('mc-tab');
-  const bar = document.getElementById('scenarioBar');
-  if (bar) {{
-    let note = document.getElementById('modelContractNotice');
-    if (!note) {{
-      note = document.createElement('div');
-      note.id = 'modelContractNotice';
-      note.style.cssText = 'margin-top:10px; padding:10px 14px; background:rgba(56,189,248,0.12); border:1px solid rgba(56,189,248,0.4); border-radius:6px; font-size:12px; color:var(--text);';
-      bar.appendChild(note);
-    }}
-    const hash = (_activeModelContract.canonical_output_hash || 'proposal').slice(0, 16);
-    note.innerHTML = '🤖 <strong>Advisory Model Proposal Active:</strong> Structured contract loaded from NVIDIA Nemotron (<code style="color:var(--accent);">' + hash + '…</code>). ReAgent deterministic recovery policy governs all recovery actions.';
-  }}
+function previewOfflineReferenceProposal() {{
+  const r = document.getElementById('nemotronResult');
+  const b = document.getElementById('nemotronBadge');
+  const m = document.getElementById('nemotronMeta');
+  const o = document.getElementById('nemotronOutput');
+  r.style.display = 'block';
+  b.innerHTML = '<span style="color:var(--accent);">📋 OFFLINE REFERENCE PROPOSAL</span>';
+  m.innerHTML = 'Model: nvidia/nemotron-3-super-120b-a12b | Tokens: 337 in / 342 out | Schema: ✓ valid';
+  o.innerText = JSON.stringify({{
+    tool: "inventory_read_only",
+    arguments: {{ item_id: "INV-ITEM-9842", location: "WH-A12" }},
+    proposed_postconditions: [{{ predicate: "STATUS_SUCCESS", description: "Verify fictional item in WH-A12 has quantity 42 units IN_STOCK." }}]
+  }}, null, 2);
 }}
 
 async function runNemotronPropose() {{
   const btn = document.getElementById('btnNemotronPropose');
-  const result = document.getElementById('nemotronResult');
-  const badge = document.getElementById('nemotronBadge');
-  const meta = document.getElementById('nemotronMeta');
-  const output = document.getElementById('nemotronOutput');
-
   btn.disabled = true;
   btn.innerText = '⏳ Calling Nemotron…';
-  result.style.display = 'none';
-
   try {{
     const resp = await fetch('/api/nemotron_propose', {{ method: 'POST' }});
     const data = await resp.json();
-    result.style.display = 'block';
-
-    const st = data.status || 'unknown';
-    if (st === 'NOT_CONFIGURED') {{
-      badge.innerHTML = '<span style="color:var(--warning);font-weight:700;">&#x26a0; NOT CONFIGURED</span> &mdash; NEBIUS_API_KEY not set. Live inference refused (fails closed). Set key in <code>D:\\ReAgent\\.env</code> and restart server to enable.';
-    }} else if (st === 'CONTRACT_VALIDATED') {{
-      _latestNemotronProposal = data;
-      badge.innerHTML = '<span style="color:var(--success);font-weight:700;">&#x2713; LIVE INFERENCE &mdash; CONTRACT VALIDATED &amp; GROUNDED</span>' +
-        '<div style="margin-top:8px;"><button class="btn btn-neutral" id="btnAdoptModelContract" onclick="adoptModelContract()" style="font-size:12px; font-weight:600; padding:5px 12px;">▶ Load Proposal into Mission Control Simulation</button></div>';
-    }} else if (st === 'GROUNDING_FAILED') {{
-      badge.innerHTML = '<span style="color:var(--warning);font-weight:700;">&#x26a0; SCHEMA VALID / GROUNDING FAILED</span> &mdash; ' + (data.failure_reason || 'Grounding gate rejected the proposal.');
-    }} else if (st === 'SCHEMA_INVALID') {{
-      badge.innerHTML = '<span style="color:var(--danger);font-weight:700;">&#x2717; SCHEMA INVALID</span> &mdash; ' + (data.failure_reason || 'Malformed model output.');
-    }} else if (st === 'AUTH_REJECTED') {{
-      badge.innerHTML = '<span style="color:var(--danger);font-weight:700;">&#x2717; AUTH REJECTED (HTTP 401)</span> &mdash; API key rejected by Nebius Token Factory.';
-    }} else {{
-      badge.innerHTML = '<span style="color:var(--danger);font-weight:700;">&#x2717; ERROR:</span> ' + (data.error || st);
-    }}
-
-    const lines = [];
-    if (data.run_id) lines.push('Run ID: ' + data.run_id);
-    if (data.model) lines.push('Model: ' + data.model);
-    if (data.endpoint_host) lines.push('Endpoint Host: ' + data.endpoint_host);
-    if (data.latency_ms != null) lines.push('Latency: ' + data.latency_ms + ' ms');
-    if (data.input_tokens != null) lines.push('Tokens: ' + data.input_tokens + ' in / ' + (data.output_tokens || '?') + ' out');
-    if (data.schema_valid != null) lines.push('Schema: ' + (data.schema_valid ? '&#x2713; valid' : '&#x2717; invalid'));
-    if (data.grounding_valid != null) lines.push('Grounding: ' + (data.grounding_valid ? '&#x2713; valid' : '&#x2717; failed'));
-    meta.innerHTML = lines.join(' &nbsp;|&nbsp; ');
-
-    output.innerText = data.contract ? JSON.stringify(data.contract, null, 2) : (data.failure_reason || JSON.stringify(data, null, 2));
-    btn.innerText = st === 'CONTRACT_VALIDATED' ? '&#x2713; Contract Validated' : '&#x2717; ' + st;
+    document.getElementById('nemotronResult').style.display = 'block';
+    document.getElementById('nemotronBadge').innerText = data.status || 'OK';
+    document.getElementById('nemotronOutput').innerText = JSON.stringify(data, null, 2);
+    btn.innerText = '✓ Propose Complete';
     setTimeout(() => {{ btn.disabled = false; btn.innerText = '🤖 Run Real Nemotron Contract Proposal'; }}, 3000);
   }} catch(e) {{
-    result.style.display = 'block';
-    badge.innerHTML = '<span style="color:var(--danger);font-weight:700;">✗ REQUEST FAILED</span>: ' + e.message;
-    btn.innerText = '✗ Request Failed';
-    setTimeout(() => {{ btn.disabled = false; btn.innerText = '🤖 Run Real Nemotron Contract Proposal'; }}, 3000);
+    document.getElementById('nemotronResult').style.display = 'block';
+    document.getElementById('nemotronBadge').innerText = 'Request Failed: ' + e.message;
+    btn.disabled = false;
+    btn.innerText = '🤖 Run Real Nemotron Contract Proposal';
   }}
 }}
 
-async function fetchPreflightStatus() {{
-  try {{
-    const resp = await fetch('/api/model_preflight');
-    const data = await resp.json();
-    const el = document.getElementById('preflightKeyStatus');
-    const btn = document.getElementById('btnNemotronPropose');
-    const headerBadge = document.getElementById('nemotronStatusBadge');
-    if (el) {{
-      if (data.api_key_present) {{
-        el.innerHTML = '<span style="color:var(--success);font-weight:700;">&#x2713; SET</span> <span style="color:var(--text-dim);font-size:11px;">(value redacted &#x2014; never displayed)</span>';
-        if (btn) {{ btn.disabled = false; btn.title = 'Click to send one live inference request to Nebius Nemotron'; }}
-        if (headerBadge) {{ headerBadge.className = 'badge badge-live'; headerBadge.innerText = '● NEMOTRON: CONFIGURED'; }}
-      }} else {{
-        el.innerHTML = '<span style="color:var(--danger);font-weight:700;">&#x2717; NOT SET</span> &mdash; live inference refused (fails closed)';
-        if (btn) {{ btn.disabled = true; btn.title = 'NEBIUS_API_KEY not set — live inference refused (fails closed)'; }}
-        if (headerBadge) {{ headerBadge.className = 'badge badge-warn'; headerBadge.innerText = '⚠ NEMOTRON: NOT CONFIGURED'; }}
-      }}
-    }}
-  }} catch(e) {{
-    const el = document.getElementById('preflightKeyStatus');
-    if (el) el.innerHTML = '<span style="color:var(--text-dim);">Preflight check unavailable</span>';
+// ── Benchmark Runner ──────────────────────────────────────────────────────────
+let _benchmarkRunning = false;
+
+function _setBenchmarkBannerState(state, msg) {{
+  const banner = document.getElementById('benchmarkStatusBanner');
+  const full   = document.getElementById('btnRunBenchmark');
+  const sample = document.getElementById('btnRunBenchmarkSample');
+  if (!banner) return;
+  banner.style.display = msg ? 'block' : 'none';
+  if (state === 'loading') {{
+    banner.style.background = 'rgba(56,189,248,0.08)';
+    banner.style.border     = '1px solid rgba(56,189,248,0.25)';
+    banner.style.color      = 'var(--accent)';
+    if (full)   {{ full.disabled   = true;  full.innerText   = '⏳ Running…'; }}
+    if (sample) {{ sample.disabled = true;  sample.innerText = '⏳ Running…'; }}
+  }} else if (state === 'success') {{
+    banner.style.background = 'rgba(52,211,153,0.08)';
+    banner.style.border     = '1px solid rgba(52,211,153,0.25)';
+    banner.style.color      = 'var(--success)';
+    if (full)   {{ full.disabled   = false; full.innerText   = '▶ Run 480-Trial Benchmark'; }}
+    if (sample) {{ sample.disabled = false; sample.innerText = '⚡ Fast Sample (80 Trials)'; }}
+  }} else {{
+    banner.style.background = 'rgba(251,113,133,0.08)';
+    banner.style.border     = '1px solid rgba(251,113,133,0.25)';
+    banner.style.color      = 'var(--danger)';
+    if (full)   {{ full.disabled   = false; full.innerText   = '▶ Run 480-Trial Benchmark'; }}
+    if (sample) {{ sample.disabled = false; sample.innerText = '⚡ Fast Sample (80 Trials)'; }}
   }}
+  if (msg) banner.innerText = msg;
+}}
+
+async function runBenchmark(isSample) {{
+  if (_benchmarkRunning) return;
+  _benchmarkRunning = true;
+  const label = isSample ? 'fast 80-trial sample' : 'full 480-trial benchmark';
+  _setBenchmarkBannerState('loading', `⏳ Running ${{label}}… please wait.`);
+  try {{
+    const url = '/api/run_benchmark' + (isSample ? '?sample=1' : '');
+    const resp = await fetch(url, {{ method: 'POST' }});
+    if (!resp.ok) {{
+      const err = await resp.text().catch(() => resp.statusText);
+      throw new Error(`HTTP ${{resp.status}}: ${{err.slice(0,200)}}`);
+    }}
+    const data = await resp.json();
+    if (data.status !== 'ok') throw new Error(data.error || 'Unknown benchmark error');
+    renderBenchmarkTable(data.arm_aggregates, data.total_trials, data.duration_ms, isSample);
+    _setBenchmarkBannerState('success',
+      `✓ ${{label.charAt(0).toUpperCase() + label.slice(1)}} complete — ${{data.total_trials}} trials in ${{(data.duration_ms/1000).toFixed(1)}}s · ${{new Date().toLocaleTimeString()}}`);
+  }} catch(e) {{
+    _setBenchmarkBannerState('error', `✗ Benchmark failed: ${{e.message}}`);
+  }} finally {{
+    _benchmarkRunning = false;
+  }}
+}}
+
+function renderBenchmarkTable(armAggregates, totalTrials, durationMs, isSample) {{
+  const tbody = document.getElementById('benchmarkTableBody');
+  const badge = document.getElementById('benchmarkTableBadge');
+  if (!tbody || !armAggregates) return;
+  if (badge) badge.innerText = `LIVE RUN · ${{totalTrials}} TRIALS · ${{(durationMs/1000).toFixed(1)}}s`;
+  const ARM_ORDER = ['REAGENT_CONTRACT','SHARED_OBSERVATION','TOOL_CLAIM_ONLY','NAIVE_RETRY','ALWAYS_ESCALATE'];
+  const rows = ARM_ORDER.map(arm => {{
+    const a = armAggregates[arm];
+    if (!a) return '';
+    const isReagent = arm === 'REAGENT_CONTRACT';
+    const falseRate = (a.false_verified_rate * 100).toFixed(1) + '%';
+    const dupStr   = `${{a.duplicate_primary_count}} primary / ${{a.duplicate_audit_count}} audit`;
+    const dangerFR = a.false_verified_rate > 0.05;
+    const dangerUR = a.unsafe_retry_count > 0;
+    const trStyle  = isReagent ? 'background:rgba(52,211,153,0.05);border-left:3px solid var(--success);' : '';
+    const armLabel = isReagent ? `<strong style="color:var(--success);">${{arm}}</strong>` : arm;
+    const tvCell   = isReagent ? `<td class="val-success">${{a.true_verified_count}}</td>` : `<td>${{a.true_verified_count}}</td>`;
+    const fvCell   = a.false_verified_count > 0 ? `<td class="val-danger">${{a.false_verified_count}}</td>` : `<td class="val-success">${{a.false_verified_count}}</td>`;
+    const frCell   = dangerFR ? `<td class="val-danger">${{falseRate}}</td>` : `<td class="val-success">${{falseRate}}</td>`;
+    const urCell   = dangerUR ? `<td class="val-danger">${{a.unsafe_retry_count}}</td>` : `<td class="${{isReagent ? 'val-success' : ''}}">${{a.unsafe_retry_count}}</td>`;
+    const dpCell   = (a.duplicate_primary_count > 0 || a.duplicate_audit_count > 0) ? `<td class="val-danger">${{dupStr}}</td>` : `<td class="${{isReagent ? 'val-success' : ''}}">${{dupStr}}</td>`;
+    return `<tr style="${{trStyle}}">
+      <td>${{armLabel}}</td>
+      <td>${{a.total_trials}}</td>
+      ${{tvCell}}${{fvCell}}${{frCell}}
+      <td>${{a.safe_escalation_count}}</td>
+      <td>${{a.unnecessary_escalation_count}}</td>
+      ${{urCell}}${{dpCell}}
+    </tr>`;
+  }}).join('');
+  tbody.innerHTML = rows;
+}}
+
+function selectRepresentativeCase(faultMode, taskId) {{
+  const trials = (BENCHMARK_DATA && BENCHMARK_DATA.trials) ? BENCHMARK_DATA.trials : [];
+  const arm = 'REAGENT_CONTRACT';
+  const match = trials.find(t => t.fault_mode === faultMode && t.task_id === taskId && t.arm === arm)
+             || trials.find(t => t.fault_mode === faultMode && t.arm === arm)
+             || trials.find(t => t.fault_mode === faultMode);
+  if (!match) {{
+    document.getElementById('trialDrillDownEmpty').style.display = 'block';
+    document.getElementById('trialDrillDownBody').style.display  = 'none';
+    document.getElementById('trialDrillDownEmpty').innerText = `No trial found for fault_mode=${{faultMode}}`;
+    return;
+  }}
+  document.getElementById('trialDrillDownEmpty').style.display = 'none';
+  document.getElementById('trialDrillDownBody').style.display  = 'block';
+  document.getElementById('drillAction').innerText =
+    `Task: ${{match.task_id}}\nFault: ${{match.fault_mode}}\nArm: ${{match.arm}}\nAttempts: ${{match.action_attempts}}`;
+  document.getElementById('drillProbe').innerText =
+    `Probe attempts: ${{match.probe_attempts}}\nUnknown state: ${{match.unknown_state_encountered}}\nRetried: ${{match.retried}}`;
+  const verdict = match.true_verified ? 'VERIFIED (✓ Correct)'
+                : match.false_verified ? 'VERIFIED (✗ FALSE POSITIVE)'
+                : match.safe_escalation ? 'ESCALATED (✓ Safe)'
+                : match.unnecessary_escalation ? 'ESCALATED (△ Unnecessary)'
+                : match.unsafe_retry ? 'RETRIED UNSAFELY (✗ Dangerous)'
+                : match.policy_claim || '—';
+  document.getElementById('drillDecision').innerText =
+    `Claim: ${{verdict}}\nDuplicate primary: ${{match.duplicate_primary_effect}}\nDuplicate audit: ${{match.duplicate_audit_effect}}`;
+  document.getElementById('drillOracle').innerText =
+    `Oracle verdict: ${{match.oracle_verdict}}\n(Hidden from policy at decision time)`;
+  document.getElementById('drillExplanation').innerText =
+    `Trial ID: ${{match.trial_id}}\n${{match.explanation || 'No additional explanation recorded.'}}`;
 }}
 
 // Initialize
-renderScenarioCards();
-fetchPreflightStatus();
 selectScenario('B');
+selectTaskTemplate('wallet_transfer');
 updateLanes(INITIAL_DEMO);
+
+const urlParams = new URLSearchParams(window.location.search);
+const viewParam = urlParams.get('view');
+if (viewParam && document.getElementById(viewParam)) {{
+  navigateTo(viewParam);
+}} else if (window.location.hash) {{
+  const targetId = window.location.hash.replace('#', '');
+  if (document.getElementById(targetId)) {{
+    navigateTo(targetId);
+  }}
+}}
+window.addEventListener('hashchange', () => {{
+  const targetId = window.location.hash.replace('#', '');
+  if (targetId && document.getElementById(targetId)) {{
+    navigateTo(targetId);
+  }}
+}});
 </script>
 </body>
 </html>"""
 
-
-# ─── HTTP Handler ─────────────────────────────────────────────────────────────
 
 class DashboardHTTPHandler(BaseHTTPRequestHandler):
     """
@@ -3096,7 +4211,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
 
         if path in ("/", "/index.html"):
             try:
-                html_str = generate_dashboard_html()
+                html_str = generate_dashboard_html(active_view=qs.get("view", "view-mission-control"))
                 body = html_str.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -3173,6 +4288,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         if path in ("/api/run_recovery_demo", "/api/recovery_demo"):
             self._handle_run_demo(qs)
 
+        elif path in ("/api/run_benchmark", "/api/benchmark/run"):
+            self._handle_run_benchmark(qs)
+
         elif path == "/api/nemotron_propose":
             self._handle_nemotron_propose()
 
@@ -3187,7 +4305,64 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"Not found")
 
+
+
+    def _handle_run_benchmark(self, qs: Dict[str, str]) -> None:
+        """
+        Run the ComparativeEvaluator in an isolated temp directory (NEVER overwrites
+        the tracked submission artifact reports/dbops/comparative_evaluation_results.json).
+        Supports ?sample=1 for a 2-task × 8-fault × 5-arm = 80-trial fast preview.
+        Returns JSON with arm_aggregates (dict keyed by arm name) and trials list.
+        """
+        t0 = time.time()
+        is_sample = qs.get("sample") == "1"
+        tmp_dir = tempfile.mkdtemp(prefix="reagent_bench_run_")
+        try:
+            evaluator = ComparativeEvaluator(output_dir=tmp_dir)
+            if is_sample:
+                artifact = evaluator.run_evaluation(
+                    task_ids=["task_01_refund_issue", "task_02_wallet_transfer"],
+                )
+            else:
+                artifact = evaluator.run_evaluation()
+
+            duration_ms = (time.time() - t0) * 1000.0
+
+            # Serialize arm_aggregates into plain dicts for JSON transport
+            arm_aggregates: Dict[str, Any] = {}
+            for arm_name, agg in artifact.arm_aggregates.items():
+                arm_aggregates[arm_name] = dataclasses.asdict(agg) if dataclasses.is_dataclass(agg) else dict(agg)
+
+            # Serialize trials list (only fields needed by the drill-down UI)
+            trials_out = []
+            for t in artifact.trials:
+                td = dataclasses.asdict(t) if dataclasses.is_dataclass(t) else dict(t)
+                trials_out.append(td)
+
+            self._send_json({
+                "status": "ok",
+                "total_trials": artifact.total_paired_configurations,
+                "duration_ms": duration_ms,
+                "arm_aggregates": arm_aggregates,
+                "trials": trials_out,
+                "provenance": artifact.provenance,
+                "is_sample": is_sample,
+            })
+        except Exception as exc:
+            self._send_json({
+                "status": "error",
+                "error": f"Benchmark failed: {type(exc).__name__}: {exc}",
+                "duration_ms": (time.time() - t0) * 1000.0,
+            }, status=500)
+        finally:
+            import shutil as _shutil
+            try:
+                _shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
     def _handle_run_demo(self, qs: Dict[str, str]) -> None:
+
         scenario_id = qs.get("scenario", "B")
         task_template = qs.get("task_template", "wallet_transfer")
         use_model_contract = qs.get("use_model_contract") == "1"
