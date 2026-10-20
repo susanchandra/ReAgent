@@ -98,6 +98,25 @@ class TestSubmissionManifestValidator(unittest.TestCase):
         self.assertFalse(success)
         self.assertIn("Schema error", details["errors"][0])
 
+    def test_05_manifest_artifacts_non_mutating(self):
+        """Verifies that reading and validating manifest does not mutate artifact bytes or hashes."""
+        manifest_path = Path("reports/dbops/submission/submission_manifest.json")
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest_data = json.load(f)
+
+        before_hashes = {}
+        for rel_path in manifest_data["artifacts"]:
+            p = Path(rel_path)
+            self.assertTrue(p.exists(), f"Artifact {rel_path} must exist")
+            before_hashes[rel_path] = compute_file_sha256(p)
+
+        success, details = validate_manifest(manifest_path=manifest_path, repo_root=Path("."), quiet=True)
+        self.assertTrue(success)
+
+        for rel_path, before_hash in before_hashes.items():
+            after_hash = compute_file_sha256(Path(rel_path))
+            self.assertEqual(before_hash, after_hash, f"Artifact {rel_path} was mutated during validation!")
+
 
 if __name__ == "__main__":
     unittest.main()

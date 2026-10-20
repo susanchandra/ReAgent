@@ -37,13 +37,13 @@
       "status": "VERIFIED"
     },
     "reports/dbops/recovery_demo_artifact.json": {
-      "size_bytes": 2244,
-      "sha256": "371e9f1ecf54fc8dc80f7f3192459ad52e1c03b540f77eb68b4815b5234c248e",
+      "size_bytes": 2194,
+      "sha256": "7477ca5104d2dfeddd30b175dd4b1920a9be8f8a19bb840e8f1fa8886f15317c",
       "status": "VERIFIED"
     },
     "reports/dbops/comparative_evaluation_results.json": {
-      "size_bytes": 422501,
-      "sha256": "0674b1a5faae2d65c1ee12acebe909c8e3b700923f8b1a22869e4a5433d1390f",
+      "size_bytes": 411211,
+      "sha256": "84aa622ac27258e67e51457bfe5fcd44cd7a8219a63ca835161d15d4960f8494",
       "status": "VERIFIED"
     },
     "reports/dbops/protocol_config_snapshot.json": {

@@ -12,6 +12,7 @@ Verifies:
 import json
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -95,15 +96,22 @@ class TestCleanStart(unittest.TestCase):
 
     def test_05_judge_demo_cli_executes_cleanly(self):
         """python -m reagent.experiments.dbops.judge_demo runs in subprocess with exit code 0."""
-        res = subprocess.run(
-            [sys.executable, "-m", "reagent.experiments.dbops.judge_demo"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        self.assertEqual(res.returncode, 0, f"judge_demo failed: {res.stderr}")
-        self.assertIn("0.0% false verifications", res.stdout)
-        self.assertIn("REAGENT_CONTRACT", res.stdout)
+        with tempfile.TemporaryDirectory(prefix="reagent_clean_start_demo_") as tmp_dir:
+            res = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "reagent.experiments.dbops.judge_demo",
+                    "--output-dir",
+                    tmp_dir,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(res.returncode, 0, f"judge_demo failed: {res.stderr}")
+            self.assertIn("0.0% false verifications", res.stdout)
+            self.assertIn("REAGENT_CONTRACT", res.stdout)
 
     def test_06_manifest_validation_clean_pass(self):
         """validate_manifest confirms 12/12 artifacts pass SHA-256 verification."""

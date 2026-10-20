@@ -56,7 +56,13 @@ hlib
 *.tmp.*
 
 # Receipts, reports, and traces (runtime artifacts)
-reports/
+reports/*
+!reports/dbops/
+reports/dbops/*
+!reports/dbops/submission/
+!reports/dbops/comparative_evaluation_results.json
+!reports/dbops/recovery_demo_artifact.json
+!reports/dbops/protocol_config_snapshot.json
 traces/
 *.receipt.json
 

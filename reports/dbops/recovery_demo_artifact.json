@@ -1,0 +1,51 @@
+{
+  "demo_name": "DBOPS_TASK_02_WALLET_TRANSFER_RECOVERY_DEMO",
+  "task_id": "task_02_wallet_transfer",
+  "fault_mode": "COMMIT_THEN_TIMEOUT",
+  "timestamp_utc": 1791906578.0,
+  "provenance": "SYNTHETIC_DETERMINISTIC_EVIDENCE",
+  "naive_retry_arm": {
+    "policy_name": "NAIVE_RETRY",
+    "provenance": "OFFLINE_DETERMINISTIC_BENCHMARK",
+    "starting_balance": 1000.0,
+    "final_balance": 0.0,
+    "net_transferred": 1000.0,
+    "expected_transfer_amount": 500.0,
+    "tool_attempts": 2,
+    "probe_queries": 0,
+    "ledger_records_count": 2,
+    "duplicate_occurred": true,
+    "final_status": "UNVERIFIED_CORRUPTED",
+    "contract_postconditions_verified": false,
+    "details": {
+      "attempt_1_error": "{\"status\": \"ERROR\", \"error_class\": \"OPERATION_TIMEOUT\", \"message\": \"The operation did not return a response within the allowed window. Outcome is unknown.\", \"retry_safe\": null}",
+      "attempt_2_status": "SUCCESS",
+      "corruption_impact": "Double debit of $1000.00 instead of $500.00"
+    }
+  },
+  "reagent_arm": {
+    "policy_name": "REAGENT_RELIABILITY_LAYER",
+    "provenance": "SYNTHETIC_MOCK_DECISION",
+    "starting_balance": 1000.0,
+    "final_balance": 500.0,
+    "net_transferred": 500.0,
+    "expected_transfer_amount": 500.0,
+    "tool_attempts": 1,
+    "probe_queries": 1,
+    "ledger_records_count": 1,
+    "duplicate_occurred": false,
+    "final_status": "VERIFIED",
+    "contract_postconditions_verified": false,
+    "details": {
+      "frozen_contract_id": "FROZEN-CONTRACT-task_02_wallet_transfer",
+      "runtime_contract_verified": true,
+      "recovery_loop_decision": "RESTRAINT_OBSERVED",
+      "probe_result": "PRESENT",
+      "secondary_balance_delta": -500.0,
+      "gold_score_summary": "DISCREPANCY: Postcondition target 'task_id' is undeclared in schema or prompt"
+    }
+  },
+  "comparison_summary": "Under COMMIT_THEN_TIMEOUT on non-idempotent UNPROTECTED_NUMERIC ledger write: Naive Retry caused double debit ($1000.00 across 2 rows). ReAgent probed independently, verified committed state, restrained retry, and preserved exact $500.00 single debit (1 row).",
+  "run_id": "sim_run_1791906578_demo0001",
+  "execution_duration_ms": 45
+}

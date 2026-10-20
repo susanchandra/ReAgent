@@ -1,0 +1,23 @@
+{
+  "manifest_version": "1.3.0-dbops-preregistered",
+  "target_model": "nvidia/nemotron-3-super-120b-a12b",
+  "temperature": 0.0,
+  "max_tokens": 1024,
+  "samples_per_task": 3,
+  "total_samples": 36,
+  "min_passing_tasks": 9,
+  "prompt_hashes": {
+    "task_01_refund_issue": "bfed8cec24ca1e74f848b3bafdc10232a1fad306f81d2e792e2e8a3cce06aa49",
+    "task_02_wallet_transfer": "ba46c21351e0ea51a546a5c24453c870b550f943fee5c42c5d7d51742e4bf468",
+    "task_03_seat_booking": "d5b9e83fbc66d2e4f8f8eb1008f3170d1c4fe0dbe0ff61ab2ecd8b110b811079",
+    "task_04_customer_merge": "bf02cdfcfd4af7e4beea87db1379a10bf41fd0f28f54f29967e9e32dc9b988c8",
+    "task_05_order_cancellation": "b7366be38ec8b5207c0abd1fb4036cc4a8c65c2e165da612990d61e61ca610cd",
+    "task_06_subscription_upgrade": "e955052af6940372cfc9ef387d647a13be3ea877837bffedf1f9b79248398663",
+    "task_07_inventory_restock": "0039998fc29ccd357dfdbf9960bc868f710f20dd3514d36ea86eea90ebf3cccb",
+    "task_08_invoice_settlement": "fa224130896966a8d7e2d8a307f69f825227142b6ed31617a677360cc568e259",
+    "task_09_discount_apply": "8f34e62a27c87f31383bcd1981345bbf1024e1dd30df02fcdac0c444241b22c2",
+    "task_10_account_deactivation": "49074782e4fb258bfc38c9658ed0828f742fc15a925be0a3e8e50a634a8e50d0",
+    "task_11_escrow_release": "90a459b4b9afc70bce1e7486025d4458df4200a6cd55198fb18f9f7eb13d208e",
+    "task_12_schema_migration": "9e89648f87b7e970007e539449e4129361e9a0b099386fb95a6503d7dcc430b3"
+  }
+}
