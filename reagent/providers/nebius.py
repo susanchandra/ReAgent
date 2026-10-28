@@ -188,8 +188,9 @@ class NebiusNemotronProvider(LLMProvider):
             self._is_configured = True
         else:
             # Key comes exclusively from environment — never accept as constructor arg.
-            api_key = os.environ.get("NEBIUS_API_KEY", "")
-            self._is_configured = bool(api_key and api_key.strip())
+            raw_key = os.environ.get("NEBIUS_API_KEY", "")
+            api_key = raw_key.strip().strip('"').strip("'") if raw_key else ""
+            self._is_configured = bool(api_key)
             if self._is_configured:
                 self._client = OpenAI(
                     api_key=api_key,

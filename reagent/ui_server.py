@@ -113,6 +113,84 @@ def is_public_mode() -> bool:
     """Return True if running in a public deployment environment (Render or REAGENT_PUBLIC_MODE=1)."""
     return bool(os.environ.get("RENDER") or os.environ.get("REAGENT_PUBLIC_MODE") == "1")
 
+
+def is_inference_locked() -> bool:
+    """Return True if live model inference is administratively locked.
+
+    REAGENT_PUBLIC_MODE=1          — HF Space / offline-test guard. Preserves all existing
+                                     regression tests that mock this env var.
+    REAGENT_DISABLE_LIVE_INFERENCE=1 — Explicit operator kill-switch, independent of
+                                       public-mode branding.
+
+    Important: running on Render (RENDER=true) does NOT lock inference by itself.
+    A Render deployment with NEBIUS_API_KEY configured will serve rate-limited live
+    inference — the key is never disclosed to clients.
+    """
+    return (
+        os.environ.get("REAGENT_PUBLIC_MODE") == "1"
+        or os.environ.get("REAGENT_DISABLE_LIVE_INFERENCE") == "1"
+    )
+
+
+class DemoRateLimiter:
+    """Thread-safe sliding-window rate limiter for the public Nemotron demo endpoint.
+
+    Limits (conservative public-demo defaults):
+      - Per-IP:  max 5 requests per 60-second window
+      - Global:  max 12 requests per 60-second window
+      - Cooldown: at least 3 seconds between consecutive requests from the same IP
+    """
+
+    _PER_IP_MAX: int = 5
+    _GLOBAL_MAX: int = 12
+    _WINDOW_S: float = 60.0
+    _COOLDOWN_S: float = 3.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._global_log: List[float] = []
+        self._ip_log: Dict[str, List[float]] = {}
+        self._ip_last: Dict[str, float] = {}
+
+    def check(self, ip: str) -> Tuple[bool, str]:
+        """Return (allowed, reason). allowed=True means the request may proceed."""
+        now = time.time()
+        cutoff = now - self._WINDOW_S
+        with self._lock:
+            # Purge expired entries
+            self._global_log = [t for t in self._global_log if t > cutoff]
+            if ip in self._ip_log:
+                self._ip_log[ip] = [t for t in self._ip_log[ip] if t > cutoff]
+
+            # Cooldown check
+            last = self._ip_last.get(ip, 0.0)
+            if now - last < self._COOLDOWN_S:
+                remaining = self._COOLDOWN_S - (now - last)
+                return False, f"Rate limit: cooldown active, retry in {remaining:.1f}s."
+
+            # Per-IP window check
+            ip_count = len(self._ip_log.get(ip, []))
+            if ip_count >= self._PER_IP_MAX:
+                return False, (
+                    f"Rate limit: max {self._PER_IP_MAX} requests per minute per IP. "
+                    "Try again in 60 seconds."
+                )
+
+            # Global window check
+            if len(self._global_log) >= self._GLOBAL_MAX:
+                return False, (
+                    "Rate limit: global demo capacity reached. Try again shortly."
+                )
+
+            # Admit the request
+            self._global_log.append(now)
+            self._ip_log.setdefault(ip, []).append(now)
+            self._ip_last[ip] = now
+            return True, ""
+
+# Singleton rate limiter — created once at import time, lives for the process lifetime.
+_demo_rate_limiter = DemoRateLimiter()
+
 # ─── Five Deterministic Scenarios (Phase 3) ──────────────────────────────────
 SCENARIOS: Dict[str, Dict[str, Any]] = {
     "A": {
@@ -1298,12 +1376,14 @@ def generate_dashboard_html(
     embedded_templates_json = _safe_json_embed(TASK_TEMPLATES)
 
     public_mode = is_public_mode()
+    inference_locked = is_inference_locked()
+    on_render = bool(os.environ.get("RENDER"))
     raw_api_key = os.environ.get("NEBIUS_API_KEY", "").strip()
-    # In public mode, never disclose whether production credentials exist on the server
+    # In public/render mode, never disclose whether production credentials exist on the server
     api_key_set = False if public_mode else bool(raw_api_key)
-    nemotron_status = "LOCKED" if public_mode else ("CONFIGURED" if api_key_set else "NOT_CONFIGURED")
+    nemotron_status = "LOCKED" if inference_locked else ("CONFIGURED" if api_key_set else "NOT_CONFIGURED")
 
-    if public_mode:
+    if inference_locked:
         _preflight_key_html = (
             '<span style="color:var(--warning);font-weight:700;">&#x1f512; LOCKED (PUBLIC DEMO)</span>'
             ' <span style="color:var(--text-dim);font-size:11px;">(Live inference disabled; fails closed safely)</span>'
@@ -1313,6 +1393,13 @@ def generate_dashboard_html(
         <strong style="color:var(--text);">Public Demonstration Security Lock:</strong> Live model inference is disabled on this public deployment to protect external credentials. ReAgent operates with an offline deterministic planner, while verified reference proposals demonstrate the structured contract schema without making external network calls.
       </div>
         """
+    elif on_render:
+        # Render deployment: live inference may be available but key status is never disclosed.
+        _preflight_key_html = (
+            '<span style="color:var(--text-muted);font-size:11px;">'
+            '(configured server-side — value never disclosed to clients)</span>'
+        )
+        _setup_instructions_html = "<!-- render deployment: no local setup instructions -->"
     elif api_key_set:
         _preflight_key_html = (
             '<span style="color:var(--success);font-weight:700;">&#x2713; SET</span>'
@@ -3826,7 +3913,7 @@ python -m reagent.ui_server</pre>
         <span style="font-weight:700;">NVIDIA Nemotron via Nebius</span>
       </div>
       <div class="sidebar-status-pill">
-        ● {'Public Demo &bull; Locked' if public_mode else ('Live &bull; Configured' if api_key_set else 'Offline &bull; Ready')}
+        ● {'Public Demo &bull; Locked' if inference_locked else ('Render &bull; Live Advisory' if on_render else ('Live &bull; Configured' if api_key_set else 'Offline &bull; Ready'))}
       </div>
     </div>
   </aside>
@@ -3851,7 +3938,7 @@ python -m reagent.ui_server</pre>
       <div class="topbar-right" style="display:flex; align-items:center; gap:12px;">
         <span class="topbar-pill" id="topbarModePill" style="font-family:var(--mono); display:none;">&bull; OFFLINE &bull; DETERMINISTIC</span>
         <span class="topbar-pill model" id="topbarModelPill" style="font-family:var(--mono); display:none;">
-          {'● Deterministic Planner (Public Demo)' if public_mode else ('● Nebius Nemotron (Advisory Mode)' if api_key_set else '● Deterministic Planner (Offline)')}
+          {'● Deterministic Planner (Public Demo)' if inference_locked else ('● Nebius Nemotron (Render Live)' if on_render else ('● Nebius Nemotron (Advisory Mode)' if api_key_set else '● Deterministic Planner (Offline)'))}
         </span>
         <button class="btn btn-neutral" id="btnThemeToggle" onclick="toggleTheme()"
           style="width:34px; height:34px; padding:0; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; border-radius:8px;"
@@ -5952,18 +6039,18 @@ python -m reagent.ui_server</pre>
         <div class="card" style="margin-bottom:18px;">
           <div class="card-head">
             <div>
-              <div class="card-title">{'Nemotron (Nebius) Advisory — Public Demo Mode (Inference Locked)' if public_mode else ('Real Nemotron (Nebius) Mode — Ready (Explicit Operator Opt-In)' if api_key_set else 'Real Nemotron (Nebius) Mode — Authorization Required')}</div>
+              <div class="card-title">{'Nemotron (Nebius) Advisory — Public Demo Mode (Inference Locked)' if inference_locked else ('Nemotron (Nebius) — Live Inference Demo (Nebius Token Factory)' if on_render else ('Real Nemotron (Nebius) Mode — Ready (Explicit Operator Opt-In)' if api_key_set else 'Real Nemotron (Nebius) Mode — Authorization Required'))}</div>
               <div style="font-size:11.5px; color:var(--text-dim); margin-top:2px;">
-                {'Live inference is disabled on this public demo. Offline Reference Proposal demonstrates the structured contract schema — no external calls are made.' if public_mode else f'Dispatches exactly one request to {DEFAULT_MODEL}. Fails closed safely if unconfigured. Live inference only on explicit operator action — zero calls on page load.'}
+                {'Live inference is disabled on this public demo. Offline Reference Proposal demonstrates the structured contract schema — no external calls are made.' if inference_locked else f'Dispatches exactly one request to {DEFAULT_MODEL}. Fails closed safely if unconfigured. Live inference only on explicit operator action — zero calls on page load.'}
               </div>
             </div>
             <div style="display:flex; gap:8px; flex-wrap:wrap;">
-              {'<!-- Live inference button hidden on public demo -->' if public_mode else f'''<button class="btn btn-primary" id="btnNemotronPropose" onclick="runNemotronPropose()"
+              {'<!-- Live inference button hidden on public demo -->' if inference_locked else f'''<button class="btn btn-primary" id="btnNemotronPropose" onclick="runNemotronPropose()"
                 {'disabled title="NEBIUS_API_KEY not set — live inference refused (fails closed)"' if nemotron_status == 'NOT_CONFIGURED' else 'title="Click to send one live inference request to Nebius Nemotron"'}>
                 Run Real Nemotron Contract Proposal
               </button>'''}
               <button class="btn btn-neutral" id="btnPreviewReference" onclick="previewOfflineReferenceProposal()">
-                {'View Offline Reference Proposal (Simulated Example)' if public_mode else 'Preview Verified Reference Proposal (Offline Demo)'}
+                {'View Offline Reference Proposal (Simulated Example)' if inference_locked else 'Preview Verified Reference Proposal (Offline Demo)'}
               </button>
             </div>
           </div>
@@ -5974,7 +6061,7 @@ python -m reagent.ui_server</pre>
               <tr><td style="color:var(--text-dim);">Endpoint</td><td><code style="color:var(--text-muted); font-family:var(--mono);">{DEFAULT_BASE_URL}</code></td></tr>
               <tr><td style="color:var(--text-dim);">Max Tokens / Temp</td><td><code style="font-family:var(--mono);">768 tokens / temp=0.0</code></td></tr>
               <tr><td style="color:var(--text-dim);">Automatic Retries</td><td><code style="font-family:var(--mono);">max_retries=0 (Strictly disabled)</code></td></tr>
-              {'<tr><td style="color:var(--text-dim);">Live Inference</td><td><span style="color:var(--warning);font-weight:700;">&#x1f512; LOCKED (PUBLIC DEMO)</span> <span style="color:var(--text-dim);font-size:11px;">No external model calls on this deployment</span></td></tr>' if public_mode else f'<tr><td style="color:var(--text-dim);">NEBIUS_API_KEY</td><td id="preflightKeyStatus">{_preflight_key_html}</td></tr>'}
+              {'<tr><td style="color:var(--text-dim);">Live Inference</td><td><span style="color:var(--warning);font-weight:700;">&#x1f512; LOCKED (PUBLIC DEMO)</span> <span style="color:var(--text-dim);font-size:11px;">No external model calls on this deployment</span></td></tr>' if inference_locked else f'<tr><td style="color:var(--text-dim);">NEBIUS_API_KEY</td><td id="preflightKeyStatus">{_preflight_key_html}</td></tr>'}
               <tr><td style="color:var(--text-dim);">Execution Authority</td><td><code style="color:var(--warning); font-family:var(--mono);">ADVISORY ONLY &mdash; model proposal cannot execute tools or declare success</code></td></tr>
             </table>
             </div>
@@ -8407,6 +8494,23 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
     def _clean_path(self) -> str:
         return urllib.parse.urlparse(self.path).path
 
+    def _get_client_ip(self) -> str:
+        """Extract client IP, respecting Render/Cloudflare proxy headers.
+
+        Handles test scenarios where headers may not be set (direct handler creation).
+        """
+        hdrs = getattr(self, "headers", None)
+        if hdrs is not None:
+            for header in ("CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"):
+                try:
+                    val = hdrs.get(header, "")
+                    if val:
+                        return val.split(",")[0].strip()
+                except Exception:
+                    pass
+        addr = getattr(self, "client_address", None)
+        return addr[0] if addr else "127.0.0.1"
+
     def do_GET(self):
         path = self._clean_path()
         qs = self._parse_qs()
@@ -8447,12 +8551,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(load_comparative_benchmark_data())
 
         elif path == "/api/model_preflight":
-            # In public mode, do not disclose whether production credentials are configured
+            # Do not disclose whether production credentials are configured on public/render deployments
             _public = is_public_mode()
+            _locked = is_inference_locked()
             api_key_raw = os.environ.get("NEBIUS_API_KEY", "")
             self._send_json({
                 "api_key_present": False if _public else bool(api_key_raw and api_key_raw.strip()),
-                "public_locked": _public,
+                "public_locked": _locked,
+                "inference_locked": _locked,
                 "model": os.environ.get("NEBIUS_NEMOTRON_MODEL", DEFAULT_MODEL),
                 "endpoint": os.environ.get("NEBIUS_BASE_URL", DEFAULT_BASE_URL),
                 "max_tokens": 768,
@@ -8839,8 +8945,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
 
     def _handle_nemotron_propose(self, qs: Optional[Dict[str, str]] = None) -> None:
         run_id = "propose_" + uuid.uuid4().hex[:16]
-        # Public Mode Guard: Lock all live model propose routes in public deployment
-        if os.environ.get("REAGENT_PUBLIC_MODE") == "1" or os.environ.get("RENDER"):
+
+        # ── Inference Lock Guard ────────────────────────────────────────────────
+        # REAGENT_PUBLIC_MODE=1 → HF Space / offline-test guard (locks all tests).
+        # REAGENT_DISABLE_LIVE_INFERENCE=1 → Explicit operator kill-switch.
+        # Running on Render (RENDER=true) alone does NOT lock inference — a Render
+        # deployment with NEBIUS_API_KEY configured serves rate-limited live inference.
+        if is_inference_locked():
             self._send_json({
                 "status": "PUBLIC_DEMO_LOCKED",
                 "run_id": "public_propose_locked",
@@ -8853,6 +8964,21 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 "grounding_valid": None,
             })
             return
+
+        # ── Rate Limit Check (protects Render + local when key is present) ─────
+        client_ip = self._get_client_ip()
+        allowed, rate_reason = _demo_rate_limiter.check(client_ip)
+        if not allowed:
+            self._send_json({
+                "status": "RATE_LIMITED",
+                "run_id": run_id,
+                "message": rate_reason,
+                "is_live": False,
+                "schema_valid": False,
+                "grounding_valid": None,
+            })
+            return
+
         t0 = time.time()
         if qs is None:
             qs = self._parse_qs()

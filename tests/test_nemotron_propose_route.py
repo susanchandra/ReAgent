@@ -165,6 +165,12 @@ PROVENANCE_INJECTION_JSON = json.dumps({
 
 class TestNemotronProposeRoute(unittest.TestCase):
 
+    def setUp(self):
+        """Reset the global rate limiter before each test to prevent cross-test bleed."""
+        import reagent.ui_server as _ui
+        from reagent.ui_server import DemoRateLimiter
+        _ui._demo_rate_limiter = DemoRateLimiter()
+
     # --- 01 Missing credentials -> NOT_CONFIGURED -------------------------
 
     def test_01_missing_key_returns_not_configured(self):

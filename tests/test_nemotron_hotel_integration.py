@@ -275,7 +275,10 @@ class TestNemotronHotelIntegration(unittest.TestCase):
 
     def test_08_ui_propose_endpoint_fails_closed_without_key(self):
         """POST /api/hotel/propose_contract fails closed when NEBIUS_API_KEY is not set."""
-        from reagent.ui_server import DashboardHTTPHandler
+        # Reset global rate limiter to prevent cross-test bleed
+        import reagent.ui_server as _ui
+        from reagent.ui_server import DashboardHTTPHandler, DemoRateLimiter
+        _ui._demo_rate_limiter = DemoRateLimiter()
         import io
         from unittest.mock import MagicMock
 
@@ -283,6 +286,7 @@ class TestNemotronHotelIntegration(unittest.TestCase):
         handler.path = "/api/hotel/propose_contract"
         handler.command = "POST"
         handler.wfile = io.BytesIO()
+        handler.headers = {}  # Required for _get_client_ip in rate-limiter check
 
         # Mock send_response, send_header, end_headers
         handler.send_response = MagicMock()
