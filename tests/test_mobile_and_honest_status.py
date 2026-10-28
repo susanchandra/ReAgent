@@ -458,6 +458,13 @@ class TestLocalModeDesktopAndOffline(_BaseServer):
             os.environ.pop("REAGENT_PUBLIC_MODE", None)
             self.assertFalse(is_public_mode())
 
+    def test_08_default_theme_is_dark(self):
+        """HTML element must declare data-theme='dark' by default."""
+        _, html = self._get("/")
+        self.assertIn('<html lang="en" data-theme="dark">', html)
+        self.assertNotIn('<html lang="en" data-theme="light">', html)
+        self.assertIn('title="Switch to light theme"', html)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1347,7 +1347,7 @@ python -m reagent.ui_server</pre>
         active_mc = " active"
 
     return f"""<!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -3855,8 +3855,8 @@ python -m reagent.ui_server</pre>
         </span>
         <button class="btn btn-neutral" id="btnThemeToggle" onclick="toggleTheme()"
           style="width:34px; height:34px; padding:0; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; border-radius:8px;"
-          title="Toggle theme" aria-label="Toggle theme">
-          <span id="themeToggleIcon" style="display:inline-flex; align-items:center; justify-content:center; transition:transform 0.35s cubic-bezier(0.4, 0, 0.2, 1);"></span>
+          title="Switch to light theme" aria-label="Switch to light theme">
+          <span id="themeToggleIcon" style="display:inline-flex; align-items:center; justify-content:center; transition:transform 0.35s cubic-bezier(0.4, 0, 0.2, 1);"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg></span>
           <span id="themeToggleLabel" style="display:none;"></span>
         </button>
         <button class="btn btn-neutral" onclick="navigateTo('view-settings')" style="padding:6px 12px; font-size:11.5px;" title="System Status & Capabilities">
@@ -6665,15 +6665,15 @@ const SCENARIO_TAGS = {{
   'E': {{ tag: 'STATE MISMATCH', color: 'var(--danger)' }}
 }};
 
-/* ─── THEME MANAGER (Persisted User Preference) ─── */
+/* ─── THEME MANAGER (Default: Dark Mode; Persisted on User Interaction) ─── */
 function initTheme() {{
   let saved = null;
-  try {{ saved = localStorage.getItem('reagent-theme'); }} catch(e) {{}}
-  const theme = saved || 'light';
-  setTheme(theme);
+  try {{ saved = localStorage.getItem('reagent-theme-user-pref'); }} catch(e) {{}}
+  const theme = (saved === 'light' || saved === 'dark') ? saved : 'dark';
+  setTheme(theme, false);
 }}
 
-function setTheme(theme) {{
+function setTheme(theme, persist = false) {{
   const btn = document.getElementById('btnThemeToggle');
   const icon = document.getElementById('themeToggleIcon');
   const lbl = document.getElementById('themeToggleLabel');
@@ -6689,18 +6689,23 @@ function setTheme(theme) {{
       icon.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>';
     }}
   }} else {{
-    document.documentElement.removeAttribute('data-theme');
+    document.documentElement.setAttribute('data-theme', 'dark');
     if (btn) btn.setAttribute('title', 'Switch to light theme');
     if (icon) {{
       icon.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>';
     }}
   }}
-  try {{ localStorage.setItem('reagent-theme', theme); }} catch(e) {{}}
+  if (persist) {{
+    try {{
+      localStorage.setItem('reagent-theme-user-pref', theme);
+      localStorage.setItem('reagent-theme', theme);
+    }} catch(e) {{}}
+  }}
 }}
 
 function toggleTheme() {{
   const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-  setTheme(isLight ? 'dark' : 'light');
+  setTheme(isLight ? 'dark' : 'light', true);
 }}
 
 function navigateTo(viewId, clickedBtn) {{
