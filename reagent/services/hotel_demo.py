@@ -219,32 +219,48 @@ def run_hotel_booking_demo(
             observer_fault=observer_fault,
         )
 
+        default_postconditions = [
+            Postcondition(
+                predicate="STATUS_SUCCESS",
+                target="reservations",
+                expected="CONFIRMED",
+                description=f"Reservation {booking_id_r} confirmed in hotel service",
+                required=True,
+            ),
+            Postcondition(
+                predicate="KEY_EXISTS",
+                target="booking_id",
+                expected=booking_id_r,
+                description="Booking ID returned by service",
+                required=True,
+            ),
+            Postcondition(
+                predicate="VALUE_EQUALS",
+                target="room_number",
+                expected="14B",
+                description="Room 14B confirmed",
+                required=True,
+            ),
+        ]
+
         if decision and decision.proposed_postconditions:
             postconditions = list(decision.proposed_postconditions)
+        elif use_model_contract and decision_provider:
+            try:
+                model_decision = decision_provider.make_structured_decision(
+                    task_objective=f"Book Room 14B at Grand Hotel for Guest Maya Lin (Booking ID: {booking_id_r}).",
+                    available_tools=["hotel_booking_http"],
+                    max_tokens=512,
+                )
+                if model_decision and getattr(model_decision, "proposed_postconditions", None):
+                    postconditions = list(model_decision.proposed_postconditions)
+                    decision = model_decision
+                else:
+                    postconditions = default_postconditions
+            except Exception:
+                postconditions = default_postconditions
         else:
-            postconditions = [
-                Postcondition(
-                    predicate="STATUS_SUCCESS",
-                    target="reservations",
-                    expected="CONFIRMED",
-                    description=f"Reservation {booking_id_r} confirmed in hotel service",
-                    required=True,
-                ),
-                Postcondition(
-                    predicate="KEY_EXISTS",
-                    target="booking_id",
-                    expected=booking_id_r,
-                    description="Booking ID returned by service",
-                    required=True,
-                ),
-                Postcondition(
-                    predicate="VALUE_EQUALS",
-                    target="room_number",
-                    expected="14B",
-                    description="Room 14B confirmed",
-                    required=True,
-                ),
-            ]
+            postconditions = default_postconditions
 
         pipe_res = pipeline.execute_with_contract(
             task=TaskState(task_id=f"hotel_task_{booking_id_r}", objective="Book Room 14B at Grand Hotel for Guest Maya"),

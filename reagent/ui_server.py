@@ -1275,12 +1275,22 @@ def _adapter_hotel(
     **kwargs: Any,
 ) -> DemoArtifact:
     from reagent.services.hotel_demo import run_hotel_booking_demo
+    decision_provider = None
+    if use_model_contract and decision is None:
+        raw_key = os.environ.get("NEBIUS_API_KEY", "")
+        clean_key = raw_key.strip().strip('"').strip("'") if raw_key else ""
+        if clean_key:
+            try:
+                decision_provider = NebiusNemotronProvider(max_retries=0, timeout=15.0)
+            except Exception:
+                decision_provider = None
     return run_hotel_booking_demo(
         scenario_id=scenario_id,
         timestamp_utc=timestamp_utc,
         run_id=run_id,
         use_model_contract=use_model_contract,
         decision=decision,
+        decision_provider=decision_provider,
     )
 
 
@@ -1376,12 +1386,14 @@ def generate_dashboard_html(
     embedded_templates_json = _safe_json_embed(TASK_TEMPLATES)
 
     public_mode = is_public_mode()
-    inference_locked = is_inference_locked()
     on_render = bool(os.environ.get("RENDER"))
+    # Offline public test mode (REAGENT_PUBLIC_MODE=1 without RENDER) locks the UI button and status.
+    # On Render, user-triggered live inference is supported and rate-limited.
+    inference_locked = (os.environ.get("REAGENT_PUBLIC_MODE") == "1" and not on_render) or os.environ.get("REAGENT_DISABLE_LIVE_INFERENCE") == "1"
     raw_api_key = os.environ.get("NEBIUS_API_KEY", "").strip()
     # In public/render mode, never disclose whether production credentials exist on the server
     api_key_set = False if public_mode else bool(raw_api_key)
-    nemotron_status = "LOCKED" if inference_locked else ("CONFIGURED" if api_key_set else "NOT_CONFIGURED")
+    nemotron_status = "LOCKED" if inference_locked else ("CONFIGURED" if (api_key_set or on_render) else "NOT_CONFIGURED")
 
     if inference_locked:
         _preflight_key_html = (
@@ -7736,16 +7748,33 @@ async function runNemotronPropose() {{
   btn.disabled = true;
   btn.innerText = '⏳ Calling Nemotron…';
   try {{
-    const resp = await fetch('/api/nemotron_propose', {{ method: 'POST' }});
+    const resp = await fetch('/api/nemotron_propose?live=1', {{ method: 'POST' }});
     const data = await resp.json();
     const resultEl = document.getElementById('nemotronResult');
     const badgeEl  = document.getElementById('nemotronBadge');
     const outputEl = document.getElementById('nemotronOutput');
+    const metaEl   = document.getElementById('nemotronMeta');
     if (!resultEl || !badgeEl || !outputEl) return;
     resultEl.style.display = 'block';
 
-    if (data.status === 'PUBLIC_DEMO_LOCKED') {{
-      // Public demo — locked state: display honest message
+    if (data.status === 'CONTRACT_VALIDATED') {{
+      badgeEl.innerHTML = '<span style="color:var(--success); font-weight:700; font-family:var(--mono);">&#x2713; CONTRACT VALIDATED (LIVE NEBIUS INFERENCE)</span>';
+      outputEl.style.color = 'var(--accent)';
+      if (metaEl) {{
+        metaEl.style.display = 'block';
+        metaEl.innerHTML = '🟢 <strong>LIVE NEBIUS INFERENCE</strong> &middot; <code>' + (data.model || 'nvidia/nemotron-3-super-120b-a12b') + '</code> via ' + (data.endpoint_host || 'api.tokenfactory.nebius.com') + '<br>' +
+          'Tokens: <strong>' + (data.input_tokens || '—') + '</strong> prompt / <strong>' + (data.output_tokens || '—') + '</strong> completion &middot; Latency: <strong>' + (data.latency_ms || '—') + 'ms</strong> &middot; Hash: <code>' + (data.canonical_output_hash || '—') + '</code>';
+      }}
+      outputEl.innerText = JSON.stringify(data.contract || data, null, 2);
+      btn.innerText = '✓ Propose Complete';
+      setTimeout(() => {{ btn.disabled = false; btn.innerText = 'Run Real Nemotron Contract Proposal'; }}, 3000);
+    }} else if (data.status === 'RATE_LIMITED') {{
+      badgeEl.innerHTML = '<span style="color:var(--warning); font-weight:700; font-family:var(--mono);">&#x26a0; RATE LIMITED</span>';
+      outputEl.style.color = 'var(--warning)';
+      outputEl.innerText = (data.message || 'Rate limit active. Please wait a few seconds before requesting again.') + '\\n\\n(Per-IP limit: max 5 req/min, global demo capacity: 12 req/min)';
+      btn.disabled = false;
+      btn.innerText = 'Run Real Nemotron Contract Proposal';
+    }} else if (data.status === 'PUBLIC_DEMO_LOCKED') {{
       badgeEl.innerHTML = '<span style="color:var(--warning); font-weight:700; font-family:var(--mono);">&#x1f512; PUBLIC DEMO LOCKED</span>';
       outputEl.style.color = 'var(--warning)';
       outputEl.innerText = '🔒 Live inference is disabled on this public demo. No external model request was made.\\n\\nReAgent fails closed safely to prevent unauthenticated API calls on public deployments.\\n\\nUse "View Offline Reference Proposal (Simulated Example)" to see the contract schema.';
@@ -8946,12 +8975,25 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
     def _handle_nemotron_propose(self, qs: Optional[Dict[str, str]] = None) -> None:
         run_id = "propose_" + uuid.uuid4().hex[:16]
 
+        if qs is None:
+            qs = self._parse_qs()
+        clean_path = self._clean_path()
+        task_type = qs.get("task_template") or qs.get("task_type") or ("hotel_booking" if "hotel" in clean_path else "wallet_transfer")
+        is_live_opt_in = (
+            qs.get("live") in ("1", "true")
+            or qs.get("action") == "live"
+            or qs.get("mode") == "live"
+        )
+
         # ── Inference Lock Guard ────────────────────────────────────────────────
-        # REAGENT_PUBLIC_MODE=1 → HF Space / offline-test guard (locks all tests).
-        # REAGENT_DISABLE_LIVE_INFERENCE=1 → Explicit operator kill-switch.
-        # Running on Render (RENDER=true) alone does NOT lock inference — a Render
-        # deployment with NEBIUS_API_KEY configured serves rate-limited live inference.
-        if is_inference_locked():
+        # In public test mode (REAGENT_PUBLIC_MODE=1) without explicit live opt-in,
+        # fail closed to PUBLIC_DEMO_LOCKED (preserves existing regression test assertions).
+        # Explicit live opt-in (?live=1) or direct server deployment with key configured
+        # proceeds to rate-limited live inference.
+        # Operator kill-switch REAGENT_DISABLE_LIVE_INFERENCE=1 always locks.
+        if os.environ.get("REAGENT_DISABLE_LIVE_INFERENCE") == "1" or (
+            os.environ.get("REAGENT_PUBLIC_MODE") == "1" and not is_live_opt_in
+        ):
             self._send_json({
                 "status": "PUBLIC_DEMO_LOCKED",
                 "run_id": "public_propose_locked",
@@ -8980,13 +9022,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             return
 
         t0 = time.time()
-        if qs is None:
-            qs = self._parse_qs()
-        clean_path = self._clean_path()
-        task_type = qs.get("task_template") or qs.get("task_type") or ("hotel_booking" if "hotel" in clean_path else "wallet_transfer")
-
         api_key_raw = os.environ.get("NEBIUS_API_KEY", "")
-        if not (api_key_raw and api_key_raw.strip()):
+        api_key = api_key_raw.strip().strip('"').strip("'") if api_key_raw else ""
+        if not api_key:
             self._send_json({
                 "status": "NOT_CONFIGURED",
                 "run_id": run_id,

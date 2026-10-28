@@ -244,13 +244,26 @@ class TestRenderWithPublicModeStillLocked(unittest.TestCase):
         return f"http://127.0.0.1:{self.port}{path}"
 
     def test_01_public_mode_still_locks_on_render(self):
-        """RENDER=true + REAGENT_PUBLIC_MODE=1 → PUBLIC_DEMO_LOCKED (offline guard wins)."""
+        """RENDER=true + REAGENT_PUBLIC_MODE=1 without ?live=1 → PUBLIC_DEMO_LOCKED."""
         req = urllib.request.Request(self._url("/api/nemotron_propose"), method="POST", data=b"{}")
         with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read().decode())
         self.assertEqual(data["status"], "PUBLIC_DEMO_LOCKED")
         self.assertFalse(data["is_live"])
         self.assertIn("locked in public demonstration mode", data["message"])
+
+    def test_02_public_mode_with_live_flag_bypasses_lock(self):
+        """RENDER=true + REAGENT_PUBLIC_MODE=1 WITH ?live=1 → bypasses PUBLIC_DEMO_LOCKED."""
+        import reagent.ui_server as _ui
+        from reagent.ui_server import DemoRateLimiter
+        _ui._demo_rate_limiter = DemoRateLimiter()
+        req = urllib.request.Request(self._url("/api/nemotron_propose?live=1"), method="POST", data=b"{}")
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+        self.assertNotEqual(data["status"], "PUBLIC_DEMO_LOCKED",
+                            "Explicit ?live=1 opt-in must bypass PUBLIC_DEMO_LOCKED")
+        # If NEBIUS_API_KEY is present (.env loaded), CONTRACT_VALIDATED is returned; otherwise NOT_CONFIGURED
+        self.assertIn(data["status"], ("CONTRACT_VALIDATED", "NOT_CONFIGURED"))
 
 
 if __name__ == "__main__":
