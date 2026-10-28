@@ -9044,8 +9044,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
 
             if task_type == "hotel_booking":
                 task_objective = (
-                    "Book Room 14B at Grand Hotel for Guest Maya Lin (Booking reference BKG-NM-9901, Amount $350.00). "
-                    "Propose success contract with independent postconditions."
+                    "Book Room 14B at Grand Hotel for Guest Maya Lin (booking_id: BKG-NM-9901, room_number: 14B, Amount: $350.00). "
+                    "Propose success contract with tool arguments booking_id and room_number, and independent postconditions "
+                    "including KEY_EXISTS (target: booking_id) and VALUE_EQUALS (target: room_number). "
+                    "STATUS_SUCCESS alone is not permitted as state-changing actions require observable state proof."
                 )
                 available_tools = ["hotel_booking_http"]
             else:
@@ -9127,6 +9129,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                         )
                 if _tool_name == "hotel_booking_http":
                     args = contract_dict.get("arguments", {})
+                    if isinstance(args, dict):
+                        if "booking_reference" in args and "booking_id" not in args:
+                            args["booking_id"] = args["booking_reference"]
                     if not isinstance(args, dict) or not {"booking_id", "room_number"}.issubset(set(args.keys())):
                         _grounding_errors.append(
                             "GroundingFail: hotel_booking_http requires 'booking_id' and 'room_number' in arguments."

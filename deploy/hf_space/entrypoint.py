@@ -42,8 +42,16 @@ class PublicSpaceDashboardHandler(DashboardHTTPHandler):
 
     def do_POST(self):
         clean_path = self._clean_path()
-        # Public Mode Guard: Lock all live model propose routes
-        if clean_path in ("/api/nemotron_propose", "/api/hotel/propose_contract"):
+        qs = self._parse_qs()
+        is_live_opt_in = (
+            qs.get("live") in ("1", "true")
+            or qs.get("action") == "live"
+            or qs.get("mode") == "live"
+        )
+        # Public Mode Guard: Lock unauthenticated live model propose routes.
+        # User-triggered explicit live requests (?live=1) delegate to base handler,
+        # which applies thread-safe rate limits and calls Nebius Nemotron.
+        if clean_path in ("/api/nemotron_propose", "/api/hotel/propose_contract") and not is_live_opt_in:
             self._send_json({
                 "status": "PUBLIC_DEMO_LOCKED",
                 "run_id": "public_propose_locked",
