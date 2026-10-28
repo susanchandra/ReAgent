@@ -8497,6 +8497,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _parse_qs(self) -> Dict[str, str]:
+        if hasattr(self, "_cached_qs"):
+            return self._cached_qs
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
         result = {k: v[0] for k, v in qs.items()}
@@ -8518,6 +8520,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                             result[k] = v[0]
         except Exception:
             pass
+        self._cached_qs = result
         return result
 
     def _clean_path(self) -> str:
