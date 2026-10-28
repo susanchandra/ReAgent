@@ -618,7 +618,63 @@ class ReAgentPipeline:
                 )
                 return dummy, esc_ev, esc_v, 0, AgentStatus.ESCALATED
 
-            probe_status = probe_res.get("status") if isinstance(probe_res, dict) else ("PRESENT" if probe_res else "ABSENT")
+            # Validate probe response structure (malformed / non-dict / missing status / invalid evidence)
+            if not isinstance(probe_res, dict) or not probe_res.get("status") or probe_res.get("malformed") is True:
+                reason = (
+                    f"MalformedObserverEvidence: Probe evidence for {tool_name} is malformed, non-dict, "
+                    f"or missing status field; unverified evidence prohibits automated retry."
+                )
+                timeline.emit("SAFETY_GATE_BLOCKED_RETRY", {"reason": reason})
+                self.agent_state.status = AgentStatus.ESCALATED
+                self.reliability_state.escalations += 1
+                dummy = ActionResult(tool_name=tool_name, success=False, error=reason)
+                esc_ev = self.evidence_collector.collect_from_action(dummy)
+                esc_v = self.verifier.verify(
+                    recovery_decision_id=f"step-{self.agent_state.step_index}-malformed-evidence",
+                    evidence=esc_ev,
+                    assertions=assertion_rules,
+                )
+                return dummy, esc_ev, esc_v, 0, AgentStatus.ESCALATED
+
+            probe_status = probe_res.get("status")
+
+            # Check for stale observation
+            if probe_res.get("stale") is True or probe_res.get("is_stale") is True:
+                reason = (
+                    f"StaleObservationProhibitsRetry: Probe returned stale evidence for {tool_name}; "
+                    f"stale observation cannot verify current outcome."
+                )
+                timeline.emit("SAFETY_GATE_BLOCKED_RETRY", {"reason": reason})
+                self.agent_state.status = AgentStatus.ESCALATED
+                self.reliability_state.escalations += 1
+                dummy = ActionResult(tool_name=tool_name, success=False, error=reason)
+                esc_ev = self.evidence_collector.collect_from_action(dummy)
+                esc_v = self.verifier.verify(
+                    recovery_decision_id=f"step-{self.agent_state.step_index}-stale-evidence",
+                    evidence=esc_ev,
+                    assertions=assertion_rules,
+                )
+                return dummy, esc_ev, esc_v, 0, AgentStatus.ESCALATED
+
+            # Correlation check: verify that probe observation belongs to current operation
+            correlation_keys = ("booking_id", "operation_id", "request_id", "idempotency_key", "txn_id", "transaction_id")
+            for k in correlation_keys:
+                if k in original_params and k in probe_res and original_params[k] != probe_res[k]:
+                    reason = (
+                        f"MismatchedOperationObservation: Probe correlated to {k}={probe_res[k]!r}, "
+                        f"but current operation is {k}={original_params[k]!r}; mismatched observation prohibits retry."
+                    )
+                    timeline.emit("SAFETY_GATE_BLOCKED_RETRY", {"reason": reason})
+                    self.agent_state.status = AgentStatus.ESCALATED
+                    self.reliability_state.escalations += 1
+                    dummy = ActionResult(tool_name=tool_name, success=False, error=reason)
+                    esc_ev = self.evidence_collector.collect_from_action(dummy)
+                    esc_v = self.verifier.verify(
+                        recovery_decision_id=f"step-{self.agent_state.step_index}-mismatched-evidence",
+                        evidence=esc_ev,
+                        assertions=assertion_rules,
+                    )
+                    return dummy, esc_ev, esc_v, 0, AgentStatus.ESCALATED
 
             # If PRESENT: side effect committed despite failure/timeout -> RESTRAIN!
             if probe_status == "PRESENT":
@@ -644,7 +700,19 @@ class ReAgentPipeline:
             if probe_status == "DELAYED":
                 try:
                     probe_res_2 = probe_callback(tool_name, original_params, 2)
-                    status_2 = probe_res_2.get("status") if isinstance(probe_res_2, dict) else ("PRESENT" if probe_res_2 else "ABSENT")
+                    if not isinstance(probe_res_2, dict) or not probe_res_2.get("status") or probe_res_2.get("malformed") is True:
+                        status_2 = "UNKNOWN"
+                    else:
+                        mismatched_2 = False
+                        for k in correlation_keys:
+                            if k in original_params and k in probe_res_2 and original_params[k] != probe_res_2[k]:
+                                mismatched_2 = True
+                                break
+                        if mismatched_2 or probe_res_2.get("stale") is True or probe_res_2.get("is_stale") is True:
+                            status_2 = "UNKNOWN"
+                        else:
+                            status_2 = probe_res_2.get("status")
+
                     if status_2 == "PRESENT":
                         timeline.emit("RESTRAINT_OBSERVED", {
                             "reason": "Step 2 delayed probe confirmed state PRESENT; avoided duplicate write.",
@@ -677,8 +745,8 @@ class ReAgentPipeline:
                     )
                     return dummy, esc_ev, esc_v, 0, AgentStatus.ESCALATED
 
-            # Invariant 1 & 2: UNKNOWN is not ABSENT. DISCREPANCY/UNKNOWN/UNAVAILABLE/UNOBSERVABLE states must NEVER trigger retry.
-            if probe_status in ("DISCREPANCY", "UNKNOWN", "UNAVAILABLE", "UNOBSERVABLE"):
+            # Invariant 1 & 2: UNKNOWN is not ABSENT. DISCREPANCY/UNKNOWN/UNAVAILABLE/UNOBSERVABLE/PARTIAL states must NEVER trigger retry.
+            if probe_status in ("DISCREPANCY", "UNKNOWN", "UNAVAILABLE", "UNOBSERVABLE", "PARTIAL", "WRONG_CONTENT"):
                 reason = (
                     f"AmbiguousOrDiscrepantStateProhibitsRetry: {tool_name} probe returned '{probe_status}'; "
                     f"UNKNOWN is not ABSENT and partial/corrupted state cannot be blindly retried. Fail-closed escalation."
@@ -698,11 +766,27 @@ class ReAgentPipeline:
             # Safety gate for retry on non-idempotent operations:
             tool_obj = self.tool_registry.get_tool(tool_name)
             is_idempotent = supports_idempotency if supports_idempotency is not None else getattr(tool_obj, "supports_idempotency_key", False)
-            is_confirmed_absent = (probe_status == "CONFIRMED_ABSENT")
+
+            # Check for unfenced or eventual-consistency absence:
+            is_unfenced = (
+                probe_res.get("fenced") is False
+                or probe_res.get("is_fenced") is False
+                or probe_res.get("authoritative") is False
+                or probe_res.get("is_authoritative") is False
+                or probe_res.get("consistency") in ("EVENTUAL", "WEAK")
+                or probe_res.get("consistency_guarantee") in ("EVENTUAL", "WEAK")
+            )
+            is_confirmed_absent = (probe_status == "CONFIRMED_ABSENT" and not is_unfenced)
 
             if not is_idempotent and not is_confirmed_absent:
                 # Ambiguous non-idempotent operation without authoritative absence confirmation -> FAIL CLOSED
-                reason = f"NonIdempotentOperationAmbiguous: {tool_name} cannot be verified absent (probe_status={probe_status}); retry prohibited."
+                if is_unfenced:
+                    reason = (
+                        f"UnfencedAbsenceProhibitsRetry: {tool_name} probe reported absence without authoritative write fencing "
+                        f"or strong consistency guarantee; eventual consistency / missing fence cannot rule out late commit. Retry prohibited."
+                    )
+                else:
+                    reason = f"NonIdempotentOperationAmbiguous: {tool_name} cannot be verified absent (probe_status={probe_status}); retry prohibited."
                 timeline.emit("SAFETY_GATE_BLOCKED_RETRY", {"reason": reason})
                 self.agent_state.status = AgentStatus.ESCALATED
                 self.reliability_state.escalations += 1

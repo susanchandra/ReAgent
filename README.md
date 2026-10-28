@@ -187,7 +187,7 @@ $$\text{true\_verified} + \text{false\_verified} + \text{safe\_escalations} + \t
 ReAgent includes comprehensive automated test suites covering recovery invariants, adversarial faults, schema validation, accounting integrity, mock provider integration, clean-start smoke tests, UI server endpoints, real Nemotron contract proposal verification, and final readiness gate constraints:
 
 ```powershell
-# Run full comprehensive test suite (583 passed, 11 skipped in ~2 minutes):
+# Run full comprehensive test suite (773 passed, 13 skipped, 20 subtests passed in ~2 minutes):
 python -m pytest tests/ -q --tb=no
 
 # Run focused UI and integration test suite:
@@ -195,7 +195,7 @@ python -m pytest tests/test_ui_server.py -v
 ```
 
 **Results:**
-- **584 Tests Passing** (11 skipped)
+- **773 Tests Passing** (13 skipped, 20 subtests passed)
 - **0 Failures / 0 Errors**
 - **Network Calls:** **ZERO** (Strictly offline)
 

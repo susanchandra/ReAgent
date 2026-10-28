@@ -85,12 +85,15 @@ class ContractManager:
                     pc.predicate, contract.contract_id,
                 )
                 continue
+            rule_id = getattr(pc, "postcondition_id", None) or f"{pc.predicate}:{pc.target or ''}"
             rules.append(
                 AssertionRule(
                     assertion_type=assertion_type,
                     key_path=pc.target,
                     expected_value=pc.expected,
                     description=pc.description,
+                    rule_id=rule_id,
+                    required=getattr(pc, "required", True),
                 )
             )
         return rules

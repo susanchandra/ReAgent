@@ -1,114 +1,139 @@
 # ReAgent: Devpost Submission Draft
 
 > **Submission Status**: **DRAFT PREPARED FOR SUBMISSION**  
-> *(Note: This document is a generated submission draft for the project owner to review and paste into Devpost. It does NOT claim that the Devpost form has already been submitted online).*
+> *(Note: This document is a generated submission draft for the project owner to review, complete personal attestations, and paste into Devpost. It does NOT claim that the Devpost form has already been submitted online).*
 
 ---
 
 ## 1. Basic Project Information
 
 - **Project Title**: ReAgent: Outcome Verification & Safe Recovery for AI Agent Actions
-- **Elevator Pitch / Tagline**: *"A timeout isn't a no."*
-  - *Supporting Line*: ReAgent checks what actually happened before an AI agent retries, so a lost response doesn't have to become a double charge.
-  - *Technical Principle*: *"Unknown is not absent."*
+- **Elevator Pitch / Tagline**: *"A timeout isn't a no. Unknown is not absent."*
+  - *Supporting Line*: ReAgent checks what actually happened before an AI agent retries, so a lost response does not become an unsafe duplicate side-effect.
+  - *Technical Principle*: Deterministic environmental verification, not model prose, retains authority over execution outcomes.
   - *Full Pitch*: An independent outcome-verification and safe-recovery layer for autonomous AI agents that eliminates false completion claims, restrains duplicate mutations on timeout ambiguity, and enforces fail-closed recovery.
 - **Target Track**: Best Apps and Agents
 - **Target Competition**: NVIDIA × Nebius Global AI Hackathon 2026
 - **License**: MIT License (Open Source, verified in root `LICENSE`)
-- **Public Repository URL**: `https://github.com/[OWNER]/ReAgent` *(Placeholder: replace with actual published GitHub URL)*
-- **Demo / Hosted URL**: `http://127.0.0.1:8080/` *(Local interactive Mission Control dashboard)*
-- **YouTube Demonstration Video URL**: `https://youtu.be/[VIDEO_ID]` *(Placeholder: replace with uploaded unlisted/public video link)*
+- **Public Repository URL**: `https://github.com/susanchandra/ReAgent` *(TODO: confirm repository visibility and final URL before submission)*
+- **Demo / Hosted URL**: `http://127.0.0.1:8080/` *(Local interactive Task Workbench & Mission Control dashboard)*
+- **Hugging Face Space**: `https://huggingface.co/spaces/...` *(TODO: confirm public Space URL if publishing; public demo endpoint is locked fail-closed without credentials)*
+- **Demonstration Video URL**: `https://youtu.be/[TODO_VIDEO_ID]` *(TODO: record sub-3-minute video using the provided demo script and paste URL here)*
 
 ---
 
 ## 2. Project Description
 
-### Inspiration
-When LLM agents are deployed to interact with enterprise databases, payment processors, and cloud infrastructure, they suffer from a dangerous failure mode: **network drops and ambiguous timeouts after partial or committed state changes**. 
-When a tool call times out or throws an unhandled socket exception, existing agent frameworks either:
-1. **Blindly retry**, causing double-charges, duplicate inventory deductions, and silent ledger corruption on non-idempotent endpoints.
-2. **Shallowly check presence** (`COUNT(*) > 0`), which falsely verifies corrupted or partial records up to 44.8% of the time.
-3. **Hallucinate success**, trusting unverified return codes.
+### The Problem: Post-Commit Ambiguity
+When LLM-driven agents interact with real-world services—such as hotel reservation APIs, database transactions, or cloud infrastructure—they face a fundamental distributed systems dilemma: **network drops and socket timeouts after state has already changed**.
 
-We built **ReAgent** to provide what agents lack: an **independent, deterministic verification barrier** that inspects actual state before declaring success or triggering retries.
+When a tool call times out or throws a connection error, existing agent frameworks typically make one of three fatal assumptions:
+1. **Blind retry on timeout**: The agent assumes timeout equals failure and re-executes the tool. On non-idempotent endpoints, this causes duplicate hotel bookings, double debits, or corrupted inventory.
+2. **Shallow presence check (`COUNT(*) > 0`)**: Checking solely whether a record exists falsely verifies corrupt, mismatched, or partial records up to 44.8% of the time.
+3. **Model self-evaluation**: Asking the LLM whether the tool succeeded allows model hallucinations to declare completion without environmental evidence.
 
-### What It Does
-ReAgent acts as an intermediary reliability layer between LLM agents and underlying execution environments:
-1. **Derives & Freezes Success Contracts**: Before an action is dispatched, ReAgent derives an immutable `SuccessContract` specifying expected database columns, value invariants, and audit requirements.
-2. **Independent Read-Only Probing**: When an action drops connection or times out (`COMMIT_THEN_TIMEOUT`), ReAgent probes the underlying system using a fresh connection with `query_only=ON` write-blocking enforced.
-3. **Restrains Redundant Retries**: If the probe reveals the side effect already successfully committed, ReAgent restrains retry, preventing catastrophic double debits.
-4. **Fails Closed**: Under unobservable states or data discrepancies (`WRONG_CONTENT`, `PARTIAL_COMMIT`), ReAgent immediately escalates rather than retrying blindly. **UNKNOWN is never treated as ABSENT.**
-5. **Interactive Mission Control**: Demonstrates 5 recovery scenarios (Normal Success, Commit-Then-Timeout, Fail-Before-Commit, Unknown Outcome with Judge Oracle Reveal, and Partial Commit) across 3 isolated fixture-backed task templates (Wallet Transfer, Hotel Booking, Database Update).
+### Core Principle
+> **"A timeout isn't a no. Unknown is not absent."**  
+> An unreceived acknowledgment does not mean the mutation failed. When outcome state cannot be authoritatively observed, automated retry must be restrained and the task safely escalated.
 
-### How We Built It
-- **LLM Intelligence**: Powered by `nvidia/nemotron-3-super-120b-a12b` via **Nebius Token Factory** for structured contract generation.
-- **Offline Candidate Validation Gate**: Strict Pydantic-based schema validation and task-grounding rules that reject ungrounded or vacuous contracts before execution.
-- **Deterministic Engine**: Built with pure Python, SQLite, and file-locked token ledgers (`GlobalTokenLedger`), ensuring 100% deterministic offline evaluation and zero external dependencies during offline judging.
-- **Evaluation Benchmark (DBOPS v1.3)**: 480 paired configurations (12 tasks &times; 8 fault modes &times; 5 policy arms) measuring false verifications, unsafe retries, and duplicate writes with mathematical denominator reconciliation.
-- **Judge-Facing Application**: A pure Python web server (`reagent/ui_server.py`) serving an interactive Mission Control dashboard, event timeline replay, receipt download, and full benchmark explorer.
-
-### Challenges We Ran Into
-- **Post-Commit Ambiguity**: In distributed systems, a timeout does not mean failure. Distinguishing between a connection drop before commit versus after commit required designing isolated read-only observers that cannot contaminate the database.
-- **Denominator & Mutual Exclusivity Accounting**: In comparative benchmarking, tracking 480 trials across 5 arms required establishing strict invariant accounting where every trial maps to exactly one outcome (`true_verified + false_verified + safe_escalations + unnecessary_escalations == 96`).
-- **Secret & Ledger Safety**: Ensuring zero accidental provider token consumption by enforcing offline preflight verifications and strict `--live-run-opt-in` CLI barriers.
-
-### Accomplishments That We're Proud Of
-- **0.0% False Verification Rate**: Across 480 paired trials, ReAgent achieved zero false verifications, compared to a **44.8% false verification rate** for shallow presence checking (`SHARED_OBSERVATION`) and **66.7%** for Naive Retry.
-- **Complete Elimination of Duplicate Debits**: While Naive Retry caused 24 unsafe retries resulting in 4 primary duplicate debits and 5 audit duplicates, ReAgent caused **zero duplicate writes**.
-- **584 Tests Passing (11 skipped)**: Comprehensive test suite covering recovery invariants, pipeline contracts, UI endpoints, and adversarial review.
-- **Zero-Dependency Judge Application**: An interactive browser UI and terminal demo that run in ~3.8 seconds without requiring API keys or external networks.
-
-### What We Learned
-- Presence does not equal correctness: testing whether a row exists is completely inadequate for enterprise reliability.
-- Models must not grade their own work: independent, deterministic rule engines must evaluate actual environmental state.
-- Safety requires fail-closed restraint: when state is unobservable, the safest response is clean human escalation.
-
-### What's Next for ReAgent
-- Extending ReAgent probe adapters to PostgreSQL, MongoDB, Stripe, and Kubernetes APIs.
-- Autonomous multi-turn recovery negotiation for distributed microservices.
-- Production deployment as a lightweight proxy sidecar for enterprise agent frameworks (LangChain, AutoGen, CrewAI).
+### What ReAgent Does: The Recovery Flow
+ReAgent introduces a deterministic verification barrier between the LLM and real-world tools:
+1. **Contract Derivation & Freezing**: Before execution, a `SuccessContract` is frozen with explicit postconditions (exact primary IDs, target entity states, expected amounts, and audit requirements). Nemotron acts as an *advisory proposal engine*; the contract is schema-validated, frozen, and immutable during execution.
+2. **Tool Invocation**: The action is dispatched to the tool (e.g. an HTTP booking service).
+3. **Independent Read-Only Probing**: When an action drops connection or times out (`COMMIT_THEN_TIMEOUT`), ReAgent does *not* blindly retry. It dispatches a fresh, independent read-only observer query across the service boundary.
+4. **Deterministic Contract Verification**: The verifier compares observed postconditions directly against the frozen contract.
+5. **Authoritative Recovery Policy**:
+   - **Prior Commit Confirmed**: Side-effect verified in state &rarr; Redundant retry is **RESTRAINED** &rarr; `VERIFIED`. Zero duplicate mutations.
+   - **Authoritative Absence Proved**: Probe confirms 0 records exist &rarr; Exactly one safe retry authorized &rarr; `VERIFIED`.
+   - **Observer Failure (Unknown State)**: Probe is unavailable (HTTP 503) &rarr; `UNKNOWN` is not `ABSENT` &rarr; Blind retry **BLOCKED** &rarr; `ESCALATED`.
+   - **Partial / Conflicting State**: Multi-table mismatch detected &rarr; Recovery **HALTED** &rarr; `ESCALATED`.
 
 ---
 
-## 3. Technology Stack & Technologies Used
+## 3. Five Flagship Scenarios (A through E)
 
-- **NVIDIA Model**: `nvidia/nemotron-3-super-120b-a12b` (used for deriving structured verification contracts and postcondition assertions).
-- **Nebius AI Cloud / Token Factory**: Used as the high-throughput inference endpoint for Nemotron models via OpenAI-compatible APIs.
-- **Backend & Verification**: Python 3.10+, SQLite, Pydantic v2, `filelock`.
-- **UI & Visualization**: Pure Python `http.server`, HTML5, CSS3, vanilla JavaScript.
+ReAgent demonstrates these recovery semantics across a dedicated local HTTP Hotel Booking Service simulator (with isolated SQLite persistence) and enterprise DBOPS tasks:
+
+- **Scenario A (Normal Success)**: Both commit and response succeed. ReAgent independently probes and verifies postconditions. Naive agent succeeds unverified.
+- **Scenario B (Commit-Then-Timeout)**: The booking commits to SQLite, but the HTTP connection drops before acknowledgment. Naive retry blindly attempts a second booking (producing a duplicate or triggering key conflicts). ReAgent's independent probe discovers the committed booking, restrains retry, and confirms success with **zero duplicate bookings**.
+- **Scenario C (Fail-Before-Commit)**: The service fails with HTTP 500 before writing to disk. ReAgent probes, authoritatively proves absence (0 records), and authorizes exactly one safe retry under policy bounds.
+- **Scenario D (Observer Unavailable)**: Tool times out and the status probe endpoint returns HTTP 503. Because outcome is genuinely `UNKNOWN`, ReAgent enforces the invariant: *UNKNOWN is not ABSENT*. It blocks automated retry and escalates cleanly.
+- **Scenario E (Partial / Conflicting State)**: A split-brain fault commits the reservation but drops the audit log. ReAgent detects the multi-table discrepancy and halts automated recovery to prevent state corruption.
 
 ---
 
-## 4. Sponsor Technology Feedback
+## 4. Architecture & Nemotron Integration
+
+- **NVIDIA Nemotron (`nvidia/nemotron-3-super-120b-a12b`)**:
+  - Used via **Nebius Token Factory** for structured proposal of contracts and failure diagnoses.
+  - **Zero-Trust Boundary**: Model prose is never treated as verification evidence. The model advises; the deterministic verifier and policy engine decide.
+  - **Offline Reference vs. Live Mode**: The entire test suite and demonstration run 100% offline and deterministically without requiring an API key. When `NEBIUS_API_KEY` is present, Nemotron provides live contract proposals; in offline mode, pre-validated reference contracts are used with explicit `OFFLINE` provenance labeling.
+  - **Public Deployment Lockout**: The Hugging Face Space deployment (`deploy/hf_space/entrypoint.py`) locks inference endpoints (`PUBLIC_DEMO_LOCKED`), preventing unauthenticated live token consumption.
+- **HTTP Hotel Booking Simulator (`reagent/services/hotel_booking_service.py`)**:
+  - Runs on a real local HTTP server on an ephemeral port.
+  - Owns its own independent SQLite database (`reservations` and `reservation_audit_log` tables).
+  - Deterministically injects socket timeouts, HTTP 500s, HTTP 503s, and partial commits.
+- **Interactive Task Workbench (`reagent/ui_server.py`)**:
+  - Single-screen judge dashboard with real-time prompt input, example task chips, live execution trace, side-by-side Naive vs. ReAgent comparison, and collapsible raw evidence inspector.
+
+---
+
+## 5. Comparative Evaluation & Benchmark
+
+Across the 480-trial paired DBOPS benchmark (12 enterprise tasks &times; 8 fault modes &times; 5 policy arms):
+- **False Verification Rate**:
+  - Naive Retry Baseline: **66.7%**
+  - Shallow Presence Check (`SHARED_OBSERVATION`): **44.8%**
+  - ReAgent Contract Verification: **0.0%**
+- **Duplicate Writes Under Ambiguous Timeouts**:
+  - Naive Retry: 24 unsafe retries resulting in duplicate ledger debits / state corruption.
+  - ReAgent: **0 duplicate debits** (all redundant retries safely restrained).
+
+---
+
+## 6. Sponsor Technology Feedback
 
 ### Feedback for Nebius Token Factory
-- **What worked well**: The OpenAI-compatible API format made provider integration clean and predictable. Token streaming and response latency for large models like Nemotron-3-Super-120B were competitive and reliable.
-- **Areas for improvement**: 
-  - Having built-in native support for strict JSON schema output (`response_format: {"type": "json_object", "schema": ...}`) directly enforced by the sampling engine would prevent schema hallucinations on structured contract derivations.
-  - Adding granular per-request spending caps and budget alerting directly in the Token Factory dashboard would provide extra safety for developer experimentation.
+- **Strengths**: High inference throughput on large Nemotron models; standard OpenAI-compatible REST endpoint simplified integration; predictable streaming behavior.
+- **Constructive Recommendations**:
+  1. Native server-side schema adherence (`response_format: {"type": "json_schema", "schema": ...}`) directly enforced by constrained decoding would eliminate schema deviations on complex composite-key tasks.
+  2. Built-in per-token request budget caps configurable in headers would provide extra safeguards for agent loop development.
 
 ### Feedback for NVIDIA Nemotron Models
-- **What worked well**: `nvidia/nemotron-3-super-120b-a12b` showed strong reasoning capabilities in decomposing complex database transaction prompts into discrete precondition and postcondition SQL predicates.
-- **Areas for improvement**: In edge cases involving composite multi-table keys, Nemotron occasionally included extraneous explanation keys outside the requested JSON schema; enforcing token-level grammar constraints at inference time would make structured extraction even more robust.
+- **Strengths**: Strong reasoning capability in translating human task objectives into structured precondition and postcondition SQL predicates.
+- **Constructive Recommendations**:
+  1. On multi-table constraint prompts, Nemotron occasionally appended conversational explanation outside the requested JSON boundaries; grammar-guided sampling helps ensure strict JSON output.
 
 ---
 
-## 5. Judge Quickstart & Reproduction Commands
+## 7. Reproduction & Quickstart Commands
 
 ```powershell
-# 1. Run the interactive offline judge demo (<4 seconds):
-python -m reagent.experiments.dbops.judge_demo
+# 1. Clone repository
+git clone https://github.com/susanchandra/ReAgent.git
+cd ReAgent
 
-# 2. Launch the local interactive web UI:
+# 2. Run automated release verification gates (30/30 preflight checks):
+python launch_demo.py --check
+
+# 3. Run canonical test suite (657 passed, 13 skipped, 10 subtests passed):
+# NOTE: Run with 'tests/' directory argument to prevent collecting root test_output.txt
+python -m pytest tests/ -q --tb=line
+
+# 4. Run focused Phase 3 & 4 Workbench test suite (51 passed, 2 skipped):
+python -m pytest tests/test_phase3_workbench.py -v --tb=short
+
+# 5. Launch local interactive Task Workbench & Mission Control:
 python reagent/ui_server.py --port 8080
 # Open browser at: http://127.0.0.1:8080/
-
-# 3. Validate cryptographic submission manifest (12/12 verified):
-python -m reagent.experiments.dbops.validate_submission_manifest
-
-# 4. Run the complete focused test suite (151 tests, all passing):
-python -W default -m unittest tests/test_dbops_m14_submission_validation.py tests/test_dbops_m13_adversarial.py tests/test_dbops_m12_invariants.py tests/test_pipeline_native_ambiguity.py tests/test_dbops_m4a_recovery_demo.py tests/test_dbops_candidate_validation_gate.py tests/test_dbops_pipeline_vertical_slice.py tests/test_dbops_pilot_eval.py tests/test_dbops_pilot_analysis.py tests/test_dbops_launcher_safety.py tests/test_dbops_m6_submission.py tests/test_ui_server.py tests/test_nemotron_provider_mock.py tests/test_clean_start.py tests/test_submission_manifest_validator.py tests/test_m5_benchmark_accounting.py
 ```
 
 ---
-*Draft prepared for NVIDIA x Nebius Global AI Hackathon 2026.*
+
+## 8. Required Personal Declarations & Attestations
+
+*(Note: In accordance with hackathon rules, personal attestations must be reviewed and confirmed directly by the participant).*
+
+- [ ] **Originality & Prior Work**: I confirm that ReAgent was developed for the NVIDIA × Nebius Global AI Hackathon 2026. Any third-party libraries or reference implementations used are open-source and listed in `requirements.txt` and project documentation.
+- [ ] **Sponsor Technology Usage**: I confirm that NVIDIA Nemotron and Nebius Token Factory were evaluated and integrated as described in the architecture.
+- [ ] **Video & Code Submission**: I confirm that the recorded demonstration video and repository links are accessible and unlisted/public for judging.

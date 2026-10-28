@@ -31,6 +31,12 @@ class RecoveryStrategyType(str, Enum):
     ABORT = "ABORT"
 
 
+class PostconditionStatus(str, Enum):
+    MET = "MET"
+    UNMET = "UNMET"
+    UNDETERMINED = "UNDETERMINED"
+
+
 class AgentStatus(str, Enum):
     IDLE = "IDLE"
     RUNNING = "RUNNING"
@@ -41,3 +47,9 @@ class AgentStatus(str, Enum):
     ESCALATED = "ESCALATED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    # Phase 2 structured tri-state outcomes
+    PARTIAL = "PARTIAL"
+    VERIFIED_FAILURE = "VERIFIED_FAILURE"
+    UNKNOWN = "UNKNOWN"
+    RECOVERY_EXHAUSTED = "RECOVERY_EXHAUSTED"
+    SKIPPED = "SKIPPED"

@@ -42,8 +42,8 @@ class PublicSpaceDashboardHandler(DashboardHTTPHandler):
 
     def do_POST(self):
         clean_path = self._clean_path()
-        # Public Mode Guard: Lock the live model propose route
-        if clean_path == "/api/nemotron_propose":
+        # Public Mode Guard: Lock all live model propose routes
+        if clean_path in ("/api/nemotron_propose", "/api/hotel/propose_contract"):
             self._send_json({
                 "status": "PUBLIC_DEMO_LOCKED",
                 "run_id": "public_propose_locked",

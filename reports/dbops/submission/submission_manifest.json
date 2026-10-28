@@ -37,8 +37,8 @@
       "status": "VERIFIED"
     },
     "reports/dbops/recovery_demo_artifact.json": {
-      "size_bytes": 2194,
-      "sha256": "7477ca5104d2dfeddd30b175dd4b1920a9be8f8a19bb840e8f1fa8886f15317c",
+      "size_bytes": 2244,
+      "sha256": "371e9f1ecf54fc8dc80f7f3192459ad52e1c03b540f77eb68b4815b5234c248e",
       "status": "VERIFIED"
     },
     "reports/dbops/comparative_evaluation_results.json": {

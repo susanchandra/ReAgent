@@ -79,7 +79,7 @@ class TestPublicDeployment(unittest.TestCase):
                 self.assertIn("ReAgent — Verify outcomes. Recover safely.", html)
                 self.assertIn("480-Trial Comparative Benchmark", html)
                 self.assertIn("Automated Quality Gates", html)
-                self.assertIn("584 / 595", html)
+                self.assertIn("767 / 780", html)
             self.assertEqual(len(guard.blocked_attempts), 0)
 
     def test_02_health_endpoint_metadata(self):

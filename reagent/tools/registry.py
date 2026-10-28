@@ -21,6 +21,9 @@ class ToolRegistry:
         """Register an allowlisted tool instance."""
         self._tools[tool.name] = tool
 
+    register_tool = register
+
+
     def get_tool(self, name: str) -> Optional[BaseTool]:
         """Look up tool by exact allowlisted name."""
         return self._tools.get(name)

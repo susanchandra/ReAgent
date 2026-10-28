@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir --user -r requirements.txt
 # Copy application packages and verified benchmark reports
 COPY --chown=user:user reagent/ reagent/
 COPY --chown=user:user reports/ reports/
+COPY --chown=user:user assets/ assets/
 COPY --chown=user:user deploy/hf_space/entrypoint.py entrypoint.py
 
 # Create writable temp directory for isolated disposable SQLite stores

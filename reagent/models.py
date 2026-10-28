@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pydantic import BaseModel, Field, ConfigDict
 import uuid
 
-from reagent.taxonomy import FailureType, RecoveryStrategyType, AgentStatus
+from reagent.taxonomy import FailureType, RecoveryStrategyType, AgentStatus, PostconditionStatus
 
 
 def get_utc_now() -> str:
@@ -108,6 +108,19 @@ class Evidence(BaseModel):
     observed_at: str = Field(default_factory=get_utc_now)
 
 
+class PostconditionEvaluation(BaseModel):
+    """Structured evaluation record for a single postcondition."""
+    model_config = ConfigDict(frozen=True)
+    postcondition_id: Optional[str] = None
+    predicate: str
+    target: Optional[str] = None
+    expected: Optional[Any] = None
+    status: PostconditionStatus
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+    explanation: str = ""
+    required: bool = True
+
+
 class VerificationResult(BaseModel):
     verification_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     recovery_decision_id: str
@@ -115,6 +128,8 @@ class VerificationResult(BaseModel):
     evidence_summary: str
     discrepancies: List[str] = Field(default_factory=list)
     verified_at: str = Field(default_factory=get_utc_now)
+    postcondition_evaluations: List[PostconditionEvaluation] = Field(default_factory=list)
+    aggregate_status: Optional[AgentStatus] = None
 
 
 class ReliabilityState(BaseModel):
@@ -142,6 +157,8 @@ class Postcondition(BaseModel):
     expected: Optional[Any] = None      # expected value or threshold
     description: str = ""
     required: bool = True               # Whether this postcondition is required vs optional
+    postcondition_id: Optional[str] = None
+
 
 
 
@@ -207,3 +224,109 @@ class StructuredDecision(BaseModel):
     diagnosis_reason: Optional[str] = None
     recovery_strategy: Optional[str] = None     # RecoveryStrategyType value
     provenance: str = "model"
+
+
+# ─────────────────────────────────────────────────
+# Phase 3 additions: Generic Composite Workflows
+# ─────────────────────────────────────────────────
+
+class WorkflowStep(BaseModel):
+    """
+    Specification of a single step within a CompositeTaskPlan.
+    Contains stable step_id, tool/capability, parameters, postconditions, and execution constraints.
+    """
+    model_config = ConfigDict(frozen=True)
+    step_id: str
+    tool_name: str
+    params: Dict[str, Any] = Field(default_factory=dict)
+    postconditions: List[Postcondition] = Field(default_factory=list)
+    description: str = ""
+    required: bool = True
+    depends_on: List[str] = Field(default_factory=list)
+    supports_idempotency: Optional[bool] = None
+    max_recovery_attempts: int = 1
+
+
+class CompositeTaskPlan(BaseModel):
+    """
+    Immutable plan defining a multi-step composite workflow.
+    Validates step ordering, unique step IDs, and dependency validity.
+    """
+    model_config = ConfigDict(frozen=True)
+    task_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    objective: str
+    steps: List[WorkflowStep]
+    created_at: str = Field(default_factory=get_utc_now)
+
+    def validate_plan(self) -> None:
+        """
+        Validate workflow plan structure:
+        - At least one step
+        - Unique step_ids
+        - Dependencies refer to preceding steps (no circular or forward references)
+        """
+        if not self.steps:
+            raise ValueError(f"CompositeTaskPlan '{self.task_id}' requires at least one step.")
+
+        seen_ids = set()
+        for i, step in enumerate(self.steps):
+            if not step.step_id:
+                raise ValueError(f"Step at index {i} in plan '{self.task_id}' is missing a step_id.")
+            if step.step_id in seen_ids:
+                raise ValueError(f"Duplicate step_id '{step.step_id}' found in plan '{self.task_id}'.")
+            for dep in step.depends_on:
+                if dep not in seen_ids:
+                    raise ValueError(
+                        f"Step '{step.step_id}' depends on '{dep}', which is not a preceding step in plan '{self.task_id}'."
+                    )
+            seen_ids.add(step.step_id)
+
+
+class StepAttempt(BaseModel):
+    """
+    Audit record of a single execution/recovery attempt for a workflow step.
+    Preserves evidence and diagnostic context across retries.
+    """
+    model_config = ConfigDict(frozen=True)
+    attempt_number: int
+    action_result: Optional[ActionResult] = None
+    evidence: Optional[Evidence] = None
+    verification_result: Optional[VerificationResult] = None
+    status: AgentStatus
+    error: Optional[str] = None
+    timestamp: str = Field(default_factory=get_utc_now)
+
+
+class StepReceipt(BaseModel):
+    """
+    Final or current outcome receipt for an individual workflow step.
+    Preserves full attempt history, authoritative evidence, and structured verification.
+    """
+    step_id: str
+    tool_name: str
+    status: AgentStatus
+    attempts: List[StepAttempt] = Field(default_factory=list)
+    verification_result: Optional[VerificationResult] = None
+    action_result: Optional[ActionResult] = None
+    evidence: Optional[Evidence] = None
+    recovery_count: int = 0
+    executed: bool = True
+    timestamp: str = Field(default_factory=get_utc_now)
+
+
+class WorkflowReceipt(BaseModel):
+    """
+    Immutable audit record representing the overall execution of a CompositeTaskPlan.
+    Distinguishes completed, incomplete, failed, and unresolved steps.
+    """
+    task_id: str
+    plan: CompositeTaskPlan
+    step_receipts: Dict[str, StepReceipt] = Field(default_factory=dict)
+    status: AgentStatus
+    completed_steps: List[str] = Field(default_factory=list)
+    incomplete_steps: List[str] = Field(default_factory=list)
+    failed_steps: List[str] = Field(default_factory=list)
+    unresolved_steps: List[str] = Field(default_factory=list)
+    execution_order: List[str] = Field(default_factory=list)
+    total_recovery_attempts: int = 0
+    created_at: str = Field(default_factory=get_utc_now)

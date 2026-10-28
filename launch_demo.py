@@ -103,19 +103,20 @@ def run_checks() -> int:
     return 0 if result.wasSuccessful() else 1
 
 
-def start_mission_control(port: int = 8080, open_browser: bool = False) -> int:
+def start_mission_control(port: int = 8080, host: Optional[str] = None, open_browser: bool = False) -> int:
     """Launch the Mission Control web server."""
-    from reagent.ui_server import start_server
+    from reagent.ui_server import start_server, resolve_bind_host
 
-    url = f"http://127.0.0.1:{port}/"
-    if open_browser:
+    resolved_host = resolve_bind_host(host)
+    url = f"http://{resolved_host}:{port}/"
+    if open_browser and resolved_host in ("127.0.0.1", "localhost"):
         try:
-            webbrowser.open(url)
+            webbrowser.open(f"http://127.0.0.1:{port}/")
         except Exception:
             pass
 
     try:
-        start_server(port=port)
+        start_server(port=port, host=resolved_host)
         return 0
     except Exception as exc:
         print(f"[ERROR] Failed to start Mission Control server: {exc}", file=sys.stderr)
@@ -128,11 +129,20 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    from reagent.ui_server import resolve_bind_host
+    default_host = resolve_bind_host()
+    default_port = int(os.environ.get("PORT", "8080"))
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=default_host,
+        help=f"Host to bind (default: {default_host})",
+    )
     parser.add_argument(
         "--port",
         type=int,
-        default=8080,
-        help="Port to serve Mission Control UI (default: 8080)",
+        default=default_port,
+        help=f"Port to serve Mission Control UI (default: {default_port})",
     )
     parser.add_argument(
         "--open",
@@ -161,7 +171,7 @@ def main() -> int:
     if args.check:
         return run_checks()
 
-    return start_mission_control(port=args.port, open_browser=args.open)
+    return start_mission_control(port=args.port, host=args.host, open_browser=args.open)
 
 
 if __name__ == "__main__":
