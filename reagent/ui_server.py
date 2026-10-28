@@ -83,8 +83,35 @@ from reagent.brand_assets import (
     REAGENT_POSTER_FRAME_B64,
 )
 
-SOURCE_GIT_REVISION = "e1292b57abcccda57c0070fdbbe6a80bae1b8834"
+def _resolve_source_git_revision() -> str:
+    """Return the active git revision from Render environment or local git."""
+    for var in ("RENDER_GIT_COMMIT", "SOURCE_GIT_REVISION", "GIT_COMMIT"):
+        val = os.environ.get(var)
+        if val and val.strip():
+            return val.strip()
+    try:
+        import subprocess
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return "e1292b57abcccda57c0070fdbbe6a80bae1b8834"
+
+
+SOURCE_GIT_REVISION = _resolve_source_git_revision()
 DEFAULT_BENCHMARK_PATH = Path("reports/dbops/comparative_evaluation_results.json")
+
+
+def is_public_mode() -> bool:
+    """Return True if running in a public deployment environment (Render or REAGENT_PUBLIC_MODE=1)."""
+    return bool(os.environ.get("RENDER") or os.environ.get("REAGENT_PUBLIC_MODE") == "1")
 
 # ─── Five Deterministic Scenarios (Phase 3) ──────────────────────────────────
 SCENARIOS: Dict[str, Dict[str, Any]] = {
@@ -1270,22 +1297,33 @@ def generate_dashboard_html(
     embedded_scenarios_json = _safe_json_embed(SCENARIOS)
     embedded_templates_json = _safe_json_embed(TASK_TEMPLATES)
 
-    api_key_set = bool(os.environ.get("NEBIUS_API_KEY", "").strip())
-    nemotron_status = "CONFIGURED" if api_key_set else "NOT_CONFIGURED"
+    public_mode = is_public_mode()
+    raw_api_key = os.environ.get("NEBIUS_API_KEY", "").strip()
+    # In public mode, never disclose whether production credentials exist on the server
+    api_key_set = False if public_mode else bool(raw_api_key)
+    nemotron_status = "LOCKED" if public_mode else ("CONFIGURED" if api_key_set else "NOT_CONFIGURED")
 
-    if api_key_set:
+    if public_mode:
+        _preflight_key_html = (
+            '<span style="color:var(--warning);font-weight:700;">&#x1f512; LOCKED (PUBLIC DEMO)</span>'
+            ' <span style="color:var(--text-dim);font-size:11px;">(Live inference disabled; fails closed safely)</span>'
+        )
+        _setup_instructions_html = """
+      <div style="background:var(--surface); border:1px solid var(--border); border-left:3px solid var(--warning); border-radius:var(--radius-sm); padding:12px 16px; margin:12px 0; font-size:12px; line-height:1.6; color:var(--text-muted);">
+        <strong style="color:var(--text);">Public Demonstration Security Lock:</strong> Live model inference is disabled on this public deployment to protect external credentials. ReAgent operates with an offline deterministic planner, while verified reference proposals demonstrate the structured contract schema without making external network calls.
+      </div>
+        """
+    elif api_key_set:
         _preflight_key_html = (
             '<span style="color:var(--success);font-weight:700;">&#x2713; SET</span>'
             ' <span style="color:var(--text-dim);font-size:11px;">(value redacted &#x2014; never displayed)</span>'
         )
+        _setup_instructions_html = "<!-- key configured: no setup instructions needed -->"
     else:
         _preflight_key_html = (
             '<span style="color:var(--danger);font-weight:700;">&#x2717; NOT SET</span>'
             ' &mdash; live inference refused (fails closed)'
         )
-    if api_key_set:
-        _setup_instructions_html = "<!-- key configured: no setup instructions needed -->"
-    else:
         _setup_instructions_html = r"""
       <div style="background:#1a1000; border:1px solid #7c4a00; border-radius:8px; padding:14px 18px; margin:12px 0; font-size:12px; line-height:1.8;">
         <div style="font-weight:700; color:#f59e0b; margin-bottom:8px;">&#x26a0; NEBIUS_API_KEY not configured &mdash; live inference disabled (fails closed)</div>
@@ -1568,6 +1606,17 @@ python -m reagent.ui_server</pre>
       display: flex;
       min-height: 100vh;
       width: 100%;
+      overflow-x: hidden;
+    }}
+
+    .mobile-menu-toggle {{
+      display: none !important;
+    }}
+    .mobile-sidebar-close {{
+      display: none !important;
+    }}
+    .mobile-sidebar-backdrop {{
+      display: none;
     }}
 
     .app-sidebar {{
@@ -1788,6 +1837,101 @@ python -m reagent.ui_server</pre>
       box-shadow: 0 4px 12px rgba(0,0,0,0.15);
     }}
     @media (max-width: 900px) {{
+      .mobile-menu-toggle {{
+        display: inline-flex !important;
+        align-items: center;
+        justify-content: center;
+        width: 34px;
+        height: 34px;
+        padding: 0;
+        min-width: 34px;
+        flex-shrink: 0;
+        cursor: pointer;
+        border-radius: var(--radius-sm);
+      }}
+      .mobile-sidebar-close {{
+        display: inline-flex !important;
+        align-items: center;
+        justify-content: center;
+        width: 30px;
+        height: 30px;
+        background: transparent;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        color: var(--text-muted);
+        font-size: 15px;
+        cursor: pointer;
+        margin-left: auto;
+      }}
+      .mobile-sidebar-close:hover {{
+        color: var(--text);
+        background: var(--surface);
+      }}
+      .mobile-sidebar-backdrop {{
+        display: block;
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.72);
+        backdrop-filter: blur(4px);
+        -webkit-backdrop-filter: blur(4px);
+        z-index: 998;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.25s ease;
+      }}
+      .mobile-sidebar-backdrop.open {{
+        opacity: 1;
+        pointer-events: auto;
+      }}
+      .app-sidebar {{
+        position: fixed !important;
+        top: 0 !important;
+        bottom: 0 !important;
+        left: 0 !important;
+        width: 280px !important;
+        max-width: 84vw !important;
+        z-index: 999 !important;
+        transform: translateX(-100%);
+        transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
+        box-shadow: none;
+      }}
+      .app-sidebar.open {{
+        transform: translateX(0) !important;
+        box-shadow: 8px 0 32px rgba(0, 0, 0, 0.85);
+      }}
+      .app-main-wrap {{
+        margin-left: 0 !important;
+        width: 100% !important;
+        min-width: 0 !important;
+      }}
+      .app-topbar {{
+        padding: 0 14px !important;
+        height: auto;
+        min-height: 52px;
+        gap: 10px;
+      }}
+      .topbar-desc-text {{
+        display: none !important;
+      }}
+      .app-content {{
+        padding: 16px 14px 32px 14px !important;
+      }}
+      .how-it-works-grid {{
+        grid-template-columns: repeat(2, 1fr) !important;
+      }}
+      .home-two-col-grid {{
+        grid-template-columns: 1fr !important;
+      }}
+      #wbMainGrid {{
+        grid-template-columns: 1fr !important;
+      }}
+      .judge-split-grid {{
+        grid-template-columns: 1fr !important;
+      }}
+      .table-responsive, .card-body {{
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+      }}
       .wb-journey-rail {{
         display: flex;
         overflow-x: auto;
@@ -1796,6 +1940,43 @@ python -m reagent.ui_server</pre>
       .wb-rail-step {{
         min-width: 140px;
         flex: 1;
+      }}
+    }}
+
+    @media (max-width: 600px) {{
+      .how-it-works-grid {{
+        grid-template-columns: 1fr !important;
+      }}
+      .home-inner-2col {{
+        grid-template-columns: 1fr !important;
+      }}
+      .wb-comparison-grid {{
+        grid-template-columns: 1fr !important;
+      }}
+      .hero-fg-wrap {{
+        padding: 20px 14px !important;
+        gap: 16px !important;
+      }}
+      .hero-stage h1 {{
+        font-size: 20px !important;
+        line-height: 1.25 !important;
+      }}
+      .hero-stage {{
+        min-height: 480px !important;
+      }}
+      .hero-lockup-inner {{
+        padding: 12px 14px !important;
+      }}
+      .hero-lockup-symbol-img {{
+        width: 60px !important;
+        height: 60px !important;
+      }}
+      .hero-lockup-wordmark-img {{
+        max-width: 150px !important;
+      }}
+      .topbar-pill {{
+        font-size: 9.5px !important;
+        padding: 2.5px 6px !important;
       }}
     }}
     .wb-rail-step {{
@@ -3563,8 +3744,11 @@ python -m reagent.ui_server</pre>
 
 <div class="app-root">
 
-  <!-- ─── SIDEBAR NAVIGATION (DESKTOP) ─── -->
-  <aside class="app-sidebar">
+  <!-- Mobile Sidebar Backdrop Overlay -->
+  <div class="mobile-sidebar-backdrop" id="sidebarBackdrop" onclick="toggleMobileMenu(false)"></div>
+
+  <!-- ─── SIDEBAR NAVIGATION (DESKTOP & MOBILE DRAWER) ─── -->
+  <aside class="app-sidebar" id="appSidebar">
     <div class="sidebar-brand">
       <div class="brand-icon-wrap" style="position:relative; overflow:hidden; width:34px; height:34px; border-radius:6px; background:#000000; border:1px solid rgba(118,185,0,0.4); display:flex; align-items:center; justify-content:center; padding:1px;">
         <img src="data:image/jpeg;base64,{REAGENT_R_MARK_B64}" alt="ReAgent Logo" style="width:100%; height:100%; object-fit:cover; border-radius:5px;" />
@@ -3576,6 +3760,9 @@ python -m reagent.ui_server</pre>
         </div>
         <div class="brand-sub-tag" style="font-size:9.5px; color:var(--text-dim); letter-spacing:0.2px;">AI Agent Failure Intelligence &amp; Safe Recovery</div>
       </div>
+      <button class="mobile-sidebar-close" id="btnMobileSidebarClose" onclick="toggleMobileMenu(false)" aria-label="Close menu" title="Close menu">
+        &#x2715;
+      </button>
     </div>
 
     <nav class="sidebar-nav">
@@ -3639,7 +3826,7 @@ python -m reagent.ui_server</pre>
         <span style="font-weight:700;">NVIDIA Nemotron via Nebius</span>
       </div>
       <div class="sidebar-status-pill">
-        ● {'Live &bull; Configured' if api_key_set else 'Offline &bull; Ready'}
+        ● {'Public Demo &bull; Locked' if public_mode else ('Live &bull; Configured' if api_key_set else 'Offline &bull; Ready')}
       </div>
     </div>
   </aside>
@@ -3649,15 +3836,22 @@ python -m reagent.ui_server</pre>
 
     <!-- Top Application Bar -->
     <header class="app-topbar" style="display:flex; justify-content:space-between; align-items:center; padding:10px 24px; background:var(--bg-topbar); border-bottom:1px solid var(--border);">
-      <div class="topbar-left" style="max-width:620px;">
-        <div style="font-size:12.5px; color:var(--text-muted); line-height:1.4;">
+      <div class="topbar-left" style="max-width:620px; display:flex; align-items:center; gap:10px;">
+        <button class="btn btn-neutral mobile-menu-toggle" id="btnMobileMenuToggle" onclick="toggleMobileMenu()" aria-label="Open navigation menu" title="Open navigation menu">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="3" y1="12" x2="21" y2="12"></line>
+            <line x1="3" y1="6" x2="21" y2="6"></line>
+            <line x1="3" y1="18" x2="21" y2="18"></line>
+          </svg>
+        </button>
+        <div class="topbar-desc-text" style="font-size:12.5px; color:var(--text-muted); line-height:1.4;">
           <strong style="color:var(--text); font-weight:700;">Not another agent.</strong> The intelligence layer that finds, explains and fixes AI agent failures &mdash; with evidence.
         </div>
       </div>
       <div class="topbar-right" style="display:flex; align-items:center; gap:12px;">
         <span class="topbar-pill" id="topbarModePill" style="font-family:var(--mono); display:none;">&bull; OFFLINE &bull; DETERMINISTIC</span>
         <span class="topbar-pill model" id="topbarModelPill" style="font-family:var(--mono); display:none;">
-          {'● Nebius Nemotron (Advisory Mode)' if api_key_set else '● Deterministic Planner (Offline)'}
+          {'● Deterministic Planner (Public Demo)' if public_mode else ('● Nebius Nemotron (Advisory Mode)' if api_key_set else '● Deterministic Planner (Offline)')}
         </span>
         <button class="btn btn-neutral" id="btnThemeToggle" onclick="toggleTheme()"
           style="width:34px; height:34px; padding:0; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; border-radius:8px;"
@@ -3752,7 +3946,7 @@ python -m reagent.ui_server</pre>
         <div style="margin:20px 0 24px 0;">
           <div style="font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:2px; color:var(--text-dim); margin-bottom:8px;">HOW IT WORKS</div>
           <h2 style="font-size:22px; font-weight:800; letter-spacing:-0.5px; margin:0 0 16px 0; color:var(--text);">The Intelligence Behind Every Decision</h2>
-          <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap:12px; align-items:stretch;">
+          <div class="how-it-works-grid" style="display:grid; grid-template-columns: repeat(5, 1fr); gap:12px; align-items:stretch;">
             <!-- 01 PROPOSE -->
             <div class="card" style="background:var(--panel-elevated); border:1px solid var(--border); border-radius:var(--radius); padding:16px; display:flex; flex-direction:column; justify-content:space-between;">
               <div>
@@ -3849,7 +4043,7 @@ python -m reagent.ui_server</pre>
         </div>
 
         <!-- Row 3: Two Columns (Nemotron Activity & Key Metrics) -->
-        <div style="display:grid; grid-template-columns: 1.1fr 1fr; gap:16px; margin-bottom:24px;">
+        <div class="home-two-col-grid" style="display:grid; grid-template-columns: 1.1fr 1fr; gap:16px; margin-bottom:24px;">
 
           <!-- Left: Nemotron Model Activity -->
           <div class="card" style="background:var(--panel-elevated); border:1px solid var(--border); border-radius:var(--radius); padding:18px;">
@@ -3865,7 +4059,7 @@ python -m reagent.ui_server</pre>
                 Configured - Not invoked (offline)
               </span>
             </div>
-            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
+            <div class="home-inner-2col" style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
               <div>
                 <div style="font-size:12px; font-weight:700; color:var(--text); margin-bottom:8px;">What you can see</div>
                 <ul style="list-style:none; padding:0; margin:0; font-size:12px; color:var(--text-muted); display:flex; flex-direction:column; gap:6px;">
@@ -5758,31 +5952,32 @@ python -m reagent.ui_server</pre>
         <div class="card" style="margin-bottom:18px;">
           <div class="card-head">
             <div>
-              <div class="card-title">{'Real Nemotron (Nebius) Mode — Ready (Explicit Operator Opt-In)' if api_key_set else 'Real Nemotron (Nebius) Mode — Authorization Required'}</div>
+              <div class="card-title">{'Nemotron (Nebius) Advisory — Public Demo Mode (Inference Locked)' if public_mode else ('Real Nemotron (Nebius) Mode — Ready (Explicit Operator Opt-In)' if api_key_set else 'Real Nemotron (Nebius) Mode — Authorization Required')}</div>
               <div style="font-size:11.5px; color:var(--text-dim); margin-top:2px;">
-                Dispatches exactly one request to {DEFAULT_MODEL}. Fails closed safely if unconfigured.
-                Live inference only on explicit operator action &mdash; zero calls on page load.
+                {'Live inference is disabled on this public demo. Offline Reference Proposal demonstrates the structured contract schema — no external calls are made.' if public_mode else f'Dispatches exactly one request to {DEFAULT_MODEL}. Fails closed safely if unconfigured. Live inference only on explicit operator action — zero calls on page load.'}
               </div>
             </div>
-            <div style="display:flex; gap:8px;">
-              <button class="btn btn-primary" id="btnNemotronPropose" onclick="runNemotronPropose()"
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              {'<!-- Live inference button hidden on public demo -->' if public_mode else f'''<button class="btn btn-primary" id="btnNemotronPropose" onclick="runNemotronPropose()"
                 {'disabled title="NEBIUS_API_KEY not set — live inference refused (fails closed)"' if nemotron_status == 'NOT_CONFIGURED' else 'title="Click to send one live inference request to Nebius Nemotron"'}>
                 Run Real Nemotron Contract Proposal
-              </button>
+              </button>'''}
               <button class="btn btn-neutral" id="btnPreviewReference" onclick="previewOfflineReferenceProposal()">
-                Preview Verified Reference Proposal (Offline Demo)
+                {'View Offline Reference Proposal (Simulated Example)' if public_mode else 'Preview Verified Reference Proposal (Offline Demo)'}
               </button>
             </div>
           </div>
           <div class="card-body">
+            <div class="table-responsive">
             <table>
               <tr><td style="color:var(--text-dim); width:220px;">Model Target</td><td><code style="color:var(--accent); font-family:var(--mono);">{DEFAULT_MODEL}</code></td></tr>
               <tr><td style="color:var(--text-dim);">Endpoint</td><td><code style="color:var(--text-muted); font-family:var(--mono);">{DEFAULT_BASE_URL}</code></td></tr>
               <tr><td style="color:var(--text-dim);">Max Tokens / Temp</td><td><code style="font-family:var(--mono);">768 tokens / temp=0.0</code></td></tr>
               <tr><td style="color:var(--text-dim);">Automatic Retries</td><td><code style="font-family:var(--mono);">max_retries=0 (Strictly disabled)</code></td></tr>
-              <tr><td style="color:var(--text-dim);">NEBIUS_API_KEY</td><td id="preflightKeyStatus">{_preflight_key_html}</td></tr>
+              {'<tr><td style="color:var(--text-dim);">Live Inference</td><td><span style="color:var(--warning);font-weight:700;">&#x1f512; LOCKED (PUBLIC DEMO)</span> <span style="color:var(--text-dim);font-size:11px;">No external model calls on this deployment</span></td></tr>' if public_mode else f'<tr><td style="color:var(--text-dim);">NEBIUS_API_KEY</td><td id="preflightKeyStatus">{_preflight_key_html}</td></tr>'}
               <tr><td style="color:var(--text-dim);">Execution Authority</td><td><code style="color:var(--warning); font-family:var(--mono);">ADVISORY ONLY &mdash; model proposal cannot execute tools or declare success</code></td></tr>
             </table>
+            </div>
 
             {_setup_instructions_html}
 
@@ -6513,6 +6708,9 @@ function navigateTo(viewId, clickedBtn) {{
   const target = document.getElementById(viewId);
   if (target) target.classList.add('active');
 
+  // Auto-close mobile drawer after navigation
+  toggleMobileMenu(false);
+
   // Sidebar nav active states
   document.querySelectorAll('.nav-link').forEach(btn => btn.classList.remove('active'));
   if (clickedBtn) {{
@@ -6562,6 +6760,32 @@ function navigateTo(viewId, clickedBtn) {{
     }}
   }}
 }}
+
+// ─── MOBILE SIDEBAR DRAWER TOGGLE ────────────────────────────────────────────
+function toggleMobileMenu(forceState) {{
+  const sidebar  = document.getElementById('appSidebar');
+  const backdrop = document.getElementById('sidebarBackdrop');
+  if (!sidebar || !backdrop) return;
+
+  const shouldOpen = (forceState === undefined)
+    ? !sidebar.classList.contains('open')
+    : Boolean(forceState);
+
+  if (shouldOpen) {{
+    sidebar.classList.add('open');
+    backdrop.classList.add('open');
+    document.body.style.overflow = 'hidden';  // prevent scroll behind drawer
+  }} else {{
+    sidebar.classList.remove('open');
+    backdrop.classList.remove('open');
+    document.body.style.overflow = '';
+  }}
+}}
+
+// Escape key closes drawer
+document.addEventListener('keydown', function(e) {{
+  if (e.key === 'Escape') toggleMobileMenu(false);
+}});
 
 // ─── REAGENT INTRO VIDEO CONTROLLER ───
 if (!window._reagentIntro) {{
@@ -7402,30 +7626,57 @@ function previewOfflineReferenceProposal() {{
   const m = document.getElementById('nemotronMeta');
   const o = document.getElementById('nemotronOutput');
   r.style.display = 'block';
-  b.innerHTML = '<span style="color:var(--accent); font-weight:700;">OFFLINE REFERENCE PROPOSAL</span>';
-  m.innerHTML = 'Model: nvidia/nemotron-3-super-120b-a12b | Tokens: 337 in / 342 out | Schema: ✓ valid';
+  b.innerHTML = '<span style="color:var(--accent); font-weight:700; font-family:var(--mono);">&#x1f4cb; OFFLINE REFERENCE PROPOSAL — Simulated Example</span>';
+  m.innerHTML = '<span style="color:var(--warning); font-weight:700;">Reference Model:</span> nvidia/nemotron-3-super-120b-a12b &nbsp;|&nbsp; <span style="color:var(--warning); font-weight:700;">Illustrative Tokens:</span> ~337 in / ~342 out <span style="color:var(--text-dim); font-size:10px;">(Simulated Fixture — not real inference usage)</span> &nbsp;|&nbsp; Schema: ✓ Valid Reference Contract';
   o.innerText = JSON.stringify({{
+    _note: "OFFLINE REFERENCE PROPOSAL — Simulated Example. No live model inference was performed.",
     tool: "inventory_read_only",
     arguments: {{ item_id: "INV-ITEM-9842", location: "WH-A12" }},
-    proposed_postconditions: [{{ predicate: "STATUS_SUCCESS", description: "Verify fictional item in WH-A12 has quantity 42 units IN_STOCK." }}]
+    proposed_postconditions: [{{ predicate: "STATUS_SUCCESS", description: "Verify fictional item in WH-A12 has quantity 42 units IN_STOCK." }}],
+    advisory_only: true,
+    execution_authority: "PROPOSAL_CANNOT_EXECUTE_TOOLS_OR_DECLARE_SUCCESS"
   }}, null, 2);
 }}
 
 async function runNemotronPropose() {{
   const btn = document.getElementById('btnNemotronPropose');
+  if (!btn) return;
   btn.disabled = true;
   btn.innerText = '⏳ Calling Nemotron…';
   try {{
     const resp = await fetch('/api/nemotron_propose', {{ method: 'POST' }});
     const data = await resp.json();
-    document.getElementById('nemotronResult').style.display = 'block';
-    document.getElementById('nemotronBadge').innerText = data.status || 'OK';
-    document.getElementById('nemotronOutput').innerText = JSON.stringify(data, null, 2);
-    btn.innerText = '✓ Propose Complete';
-    setTimeout(() => {{ btn.disabled = false; btn.innerText = 'Run Real Nemotron Contract Proposal'; }}, 3000);
+    const resultEl = document.getElementById('nemotronResult');
+    const badgeEl  = document.getElementById('nemotronBadge');
+    const outputEl = document.getElementById('nemotronOutput');
+    if (!resultEl || !badgeEl || !outputEl) return;
+    resultEl.style.display = 'block';
+
+    if (data.status === 'PUBLIC_DEMO_LOCKED') {{
+      // Public demo — locked state: display honest message
+      badgeEl.innerHTML = '<span style="color:var(--warning); font-weight:700; font-family:var(--mono);">&#x1f512; PUBLIC DEMO LOCKED</span>';
+      outputEl.style.color = 'var(--warning)';
+      outputEl.innerText = '🔒 Live inference is disabled on this public demo. No external model request was made.\\n\\nReAgent fails closed safely to prevent unauthenticated API calls on public deployments.\\n\\nUse "View Offline Reference Proposal (Simulated Example)" to see the contract schema.';
+      btn.disabled = false;
+      btn.innerText = 'Run Real Nemotron Contract Proposal';
+    }} else if (data.status === 'NOT_CONFIGURED') {{
+      badgeEl.innerHTML = '<span style="color:var(--danger); font-weight:700; font-family:var(--mono);">✗ NOT CONFIGURED</span>';
+      outputEl.style.color = 'var(--text-muted)';
+      outputEl.innerText = data.message || 'NEBIUS_API_KEY is not set. Live inference refused (fails closed).';
+      btn.disabled = false;
+      btn.innerText = 'Run Real Nemotron Contract Proposal';
+    }} else {{
+      badgeEl.innerText = data.status || 'OK';
+      outputEl.style.color = 'var(--accent)';
+      outputEl.innerText = JSON.stringify(data, null, 2);
+      btn.innerText = '✓ Propose Complete';
+      setTimeout(() => {{ btn.disabled = false; btn.innerText = 'Run Real Nemotron Contract Proposal'; }}, 3000);
+    }}
   }} catch(e) {{
-    document.getElementById('nemotronResult').style.display = 'block';
-    document.getElementById('nemotronBadge').innerText = 'Request Failed: ' + e.message;
+    const resultEl = document.getElementById('nemotronResult');
+    const badgeEl  = document.getElementById('nemotronBadge');
+    if (resultEl) resultEl.style.display = 'block';
+    if (badgeEl)  badgeEl.innerText = 'Request Failed: ' + e.message;
     btn.disabled = false;
     btn.innerText = 'Run Real Nemotron Contract Proposal';
   }}
@@ -8180,7 +8431,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 "version": "2.0.0",
                 "mode": "OFFLINE_DETERMINISTIC",
                 "network_calls_allowed": False,
-                "source_git_revision": SOURCE_GIT_REVISION,
+                "source_git_revision": _resolve_source_git_revision(),
                 "scenarios": list(SCENARIOS.keys()),
             })
 
@@ -8191,9 +8442,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(load_comparative_benchmark_data())
 
         elif path == "/api/model_preflight":
+            # In public mode, do not disclose whether production credentials are configured
+            _public = is_public_mode()
             api_key_raw = os.environ.get("NEBIUS_API_KEY", "")
             self._send_json({
-                "api_key_present": bool(api_key_raw and api_key_raw.strip()),
+                "api_key_present": False if _public else bool(api_key_raw and api_key_raw.strip()),
+                "public_locked": _public,
                 "model": os.environ.get("NEBIUS_NEMOTRON_MODEL", DEFAULT_MODEL),
                 "endpoint": os.environ.get("NEBIUS_BASE_URL", DEFAULT_BASE_URL),
                 "max_tokens": 768,

@@ -461,7 +461,11 @@ async function run() {{
   // 3. Run Recovery Simulation
   await send('Runtime.evaluate', {{ expression: `selectScenario('B')` }});
   await send('Runtime.evaluate', {{ expression: `document.getElementById('btnRun')?.click()` }});
-  await new Promise(r => setTimeout(r, 1800));
+  for (let i = 0; i < 40; i++) {{
+    const check = await send('Runtime.evaluate', {{ expression: `!!_runResult` }});
+    if (check?.result?.value) break;
+    await new Promise(r => setTimeout(r, 100));
+  }}
 
   const runResults = await send('Runtime.evaluate', {{
     expression: `(() => {{
