@@ -244,7 +244,18 @@ def run_hotel_booking_demo(
         ]
 
         if decision and decision.proposed_postconditions:
-            postconditions = list(decision.proposed_postconditions)
+            from reagent.contract_validator import validate_contract_proposal
+            c_dict = decision.model_dump() if hasattr(decision, "model_dump") else (decision.dict() if hasattr(decision, "dict") else dict(decision))
+            val = validate_contract_proposal(
+                contract_dict=c_dict,
+                task_objective=f"Book Room 14B at Grand Hotel for Guest Maya Lin (Booking ID: {booking_id_r}).",
+                workflow="hotel_booking",
+                task_context={"booking_id": decision.arguments.get("booking_id", booking_id_r), "room_number": "14B"},
+            )
+            if val.is_valid:
+                postconditions = list(decision.proposed_postconditions)
+            else:
+                postconditions = default_postconditions
         elif use_model_contract and decision_provider:
             try:
                 model_decision = decision_provider.make_structured_decision(
@@ -253,8 +264,19 @@ def run_hotel_booking_demo(
                     max_tokens=512,
                 )
                 if model_decision and getattr(model_decision, "proposed_postconditions", None):
-                    postconditions = list(model_decision.proposed_postconditions)
-                    decision = model_decision
+                    from reagent.contract_validator import validate_contract_proposal
+                    c_dict = model_decision.model_dump() if hasattr(model_decision, "model_dump") else (model_decision.dict() if hasattr(model_decision, "dict") else dict(model_decision))
+                    val = validate_contract_proposal(
+                        contract_dict=c_dict,
+                        task_objective=f"Book Room 14B at Grand Hotel for Guest Maya Lin (Booking ID: {booking_id_r}).",
+                        workflow="hotel_booking",
+                        task_context={"booking_id": booking_id_r, "room_number": "14B"},
+                    )
+                    if val.is_valid:
+                        postconditions = list(model_decision.proposed_postconditions)
+                        decision = model_decision
+                    else:
+                        postconditions = default_postconditions
                 else:
                     postconditions = default_postconditions
             except Exception:

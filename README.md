@@ -6,7 +6,9 @@
 > **Category:** Outcome verification and safe recovery for AI-agent actions<br>
 > **Target Track:** Best Apps & Agents — NVIDIA × Nebius Global AI Hackathon 2026<br>
 > **Target Architecture:** NVIDIA Nemotron (`nvidia/nemotron-3-super-120b-a12b`) on Nebius Token Factory<br>
-> **Provenance:** SYNTHETIC / DETERMINISTIC OFFLINE FIXTURES (0 network calls required for offline judging)<br>
+> **Live Production Demo:** [https://reagent-app-nwif.onrender.com/](https://reagent-app-nwif.onrender.com/)<br>
+> **Default Evaluation Mode:** SYNTHETIC / DETERMINISTIC OFFLINE FIXTURES (0 network calls required for offline judging)<br>
+> **Live Inference Mode:** Opt-in real Nebius Token Factory inference (`?live=1`) with server-side rate limits & strict semantic contract validation<br>
 > **License:** MIT License (Open Source)
 
 ---
@@ -88,12 +90,20 @@ To the agent, both cases look identical: an unhandled timeout error.
 ### What NVIDIA Nemotron Does
 ReAgent leverages **`nvidia/nemotron-3-super-120b-a12b`** hosted on **Nebius Token Factory**. Its role is strictly defined:
 - **Contract Derivation**: Translates user task specifications and database schemas into structured JSON contracts specifying exact primary table predicates, expected column values, and multi-table audit assertions.
-- **Candidate Validation**: Candidate contracts are passed through an offline candidate validation gate that strictly enforces schema rules, rejects hallucinated keys, and verifies grounding against declared task parameters.
-- **Fail-Closed Isolation**: If the model produces unparseable JSON or violates schemas, ReAgent rejects the candidate and fails closed—it never falls back to an unverified action.
+- **Candidate Grounding & Semantic Validation**: Candidate contracts are passed through an offline candidate validation gate (`validate_contract_proposal`) that strictly enforces:
+  1. Valid JSON adhering to contract schema.
+  2. Supported tool allowlist per workflow (`hotel_booking_http`, `dbops_read_only`, `dbops_database`, `wallet_transfer`).
+  3. Context binding: Task identifiers (`booking_id`, `room_number`, `txn_id`) must match trusted context; model output cannot redirect actions or invent arbitrary targets.
+  4. Predicate requirements: Required target/expected values per predicate; generic `STATUS_SUCCESS` ("Action must succeed") is rejected wherever concrete state must be observed.
+  5. Observer capability: Postcondition targets must map to observable state properties.
+  6. Provenance protection: Model output is advisory; provenance cannot be forged as executed or verified.
+- **Fail-Closed Isolation**: If the model produces unparseable JSON, generic ungrounded assertions, or violates schemas, ReAgent rejects the proposal and fails closed (`SCHEMA_INVALID` or `GROUNDING_FAILED`)—it never falls back to an unverified action.
 
 ### How Nebius Token Factory is Used
-- Nebius Token Factory serves as the high-performance inference backend, accessed via standard OpenAI-compatible endpoints with token streaming and pre-flight parameter guards (`temperature=0.0`, `max_tokens=512`).
-- To protect developer credits, all benchmark evaluations and test suites run in **100% offline mode** using deterministic mocks. Live Nebius requests require explicit human authorization via `--live-run-opt-in`.
+- Nebius Token Factory serves as the high-performance inference backend, accessed via standard OpenAI-compatible endpoints with pre-flight parameter guards (`temperature=0.0`, `max_tokens=512`).
+- **Two Distinct Modes**:
+  - **Live Inference**: In the interactive Mission Control / Task Workbench, users can opt-in to live Nebius inference via the UI toggle or `?live=1` query parameter. Calls are rate-limited, tracked in a durable token ledger, guarded against unbounded inputs, and server-side authenticated (API keys are never exposed).
+  - **Offline Deterministic Fixtures (Default)**: To protect developer credits and ensure 100% reproducible benchmark evaluation, all automated test suites and offline judging flows use deterministic fixtures with explicit `OFFLINE` provenance labeling. Live model failures never silently fall back to simulated fixtures under a live label.
 
 ---
 
@@ -184,20 +194,23 @@ $$\text{true\_verified} + \text{false\_verified} + \text{safe\_escalations} + \t
 
 ## 6. Running the Automated Test Suite
 
-ReAgent includes comprehensive automated test suites covering recovery invariants, adversarial faults, schema validation, accounting integrity, mock provider integration, clean-start smoke tests, UI server endpoints, real Nemotron contract proposal verification, and final readiness gate constraints:
+ReAgent includes comprehensive automated test suites covering recovery invariants, adversarial faults, schema validation, accounting integrity, mock provider integration, clean-start smoke tests, UI server endpoints, strict semantic contract verification, and final readiness gate constraints:
 
 ```powershell
-# Run full comprehensive test suite (773 passed, 13 skipped, 20 subtests passed in ~2 minutes):
-python -m pytest tests/ -q --tb=no
+# Run full comprehensive test suite across tests/ and deploy/hf_space/tests/ (874 passed, 13 skipped, 20 subtests passed):
+python -m pytest tests/ deploy/hf_space/tests/ -q
+
+# Run focused semantic contract and observer verification test suite:
+python -m pytest tests/test_semantic_contract_verification.py -v
 
 # Run focused UI and integration test suite:
 python -m pytest tests/test_ui_server.py -v
 ```
 
 **Results:**
-- **773 Tests Passing** (13 skipped, 20 subtests passed)
+- **874 Tests Passing** (13 skipped, 20 subtests passed)
 - **0 Failures / 0 Errors**
-- **Network Calls:** **ZERO** (Strictly offline)
+- **Network Calls:** **ZERO** (Strictly offline by default)
 
 ---
 
@@ -222,9 +235,10 @@ python run_live_pilot.py --live-run-opt-in
 
 ## 8. Limitations & Honest Engineering Disclosure
 
-- **Synthetic vs. Live Evidence**: All benchmark metrics (480 trials) and interactive demonstrations are derived from deterministic SQLite fixtures with simulated fault injection. This rigorously isolates and validates the algorithmic recovery semantics and retry restraint.
-- **Model-Derived Contract Arm**: While candidate contract validation and schema allowlists are fully verified offline, live dynamic contract extraction using `nvidia/nemotron-3-super-120b-a12b` remains deferred pending explicit human authorization and network opt-in.
-- **Safety Trade-off**: ReAgent intentionally prioritizes safety over blind completion. Under ambiguous unobservable states, it escalates rather than retrying blindly, resulting in a higher escalation rate but **100% protection against data corruption**.
+- **Synthetic vs. Live Evidence**: All benchmark metrics (480 trials) and default demonstration replays are derived from deterministic SQLite fixtures with simulated fault injection. This rigorously isolates and validates the algorithmic recovery semantics and retry restraint across all 8 fault modes.
+- **Model-Derived Contract Arm**: Real live inference using `nvidia/nemotron-3-super-120b-a12b` via Nebius Token Factory is fully operational on user opt-in (`?live=1` or the UI toggle). It requires an explicit user action and is safeguarded by token rate limits and candidate semantic validation. Offline reference proposals remain the default for repeatable zero-cost evaluation.
+- **Advisory Model vs. Authoritative Observer**: Nemotron is strictly advisory—it derives proposed contracts, but an independent read-only observer probe querying actual SQLite/API state retains sole authority over whether an action succeeded.
+- **Safety Trade-off**: ReAgent intentionally prioritizes safety over blind completion. Under ambiguous unobservable states (`UNKNOWN`), it escalates to an operator rather than retrying blindly (*"Unknown is not absent"*), resulting in a higher escalation rate under severe faults but **100% protection against duplicate mutations and financial data corruption**.
 
 ---
 

@@ -16,8 +16,8 @@
 - **Target Competition**: NVIDIA × Nebius Global AI Hackathon 2026
 - **License**: MIT License (Open Source, verified in root `LICENSE`)
 - **Public Repository URL**: `https://github.com/susanchandra/ReAgent` *(TODO: confirm repository visibility and final URL before submission)*
-- **Demo / Hosted URL**: `http://127.0.0.1:8080/` *(Local interactive Task Workbench & Mission Control dashboard)*
-- **Hugging Face Space**: `https://huggingface.co/spaces/...` *(TODO: confirm public Space URL if publishing; public demo endpoint is locked fail-closed without credentials)*
+- **Demo / Hosted URL**: `https://reagent-app-nwif.onrender.com/` *(Live production deployment on Render; local interactive dashboard at `http://127.0.0.1:8080/`)*
+- **Hugging Face Space / Standalone Port**: Public deployment runs fail-closed by default, enabling live Nemotron inference with human opt-in (`?live=1`) while preserving offline reference mode
 - **Demonstration Video URL**: `https://youtu.be/[TODO_VIDEO_ID]` *(TODO: record sub-3-minute video using the provided demo script and paste URL here)*
 
 ---
@@ -116,9 +116,8 @@ cd ReAgent
 # 2. Run automated release verification gates (30/30 preflight checks):
 python launch_demo.py --check
 
-# 3. Run canonical test suite (657 passed, 13 skipped, 10 subtests passed):
-# NOTE: Run with 'tests/' directory argument to prevent collecting root test_output.txt
-python -m pytest tests/ -q --tb=line
+# 3. Run full automated test suite (874 passed, 13 skipped, 20 subtests passed):
+python -m pytest tests/ deploy/hf_space/tests/ -q
 
 # 4. Run focused Phase 3 & 4 Workbench test suite (51 passed, 2 skipped):
 python -m pytest tests/test_phase3_workbench.py -v --tb=short

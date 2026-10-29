@@ -683,12 +683,22 @@ class ReAgentPipeline:
                 })
                 self._record_action_success()
                 self.agent_state.status = AgentStatus.VERIFIED
+                probe_data = probe_res.get("data") if isinstance(probe_res.get("data"), dict) else {}
                 restrained_action = ActionResult(
                     tool_name=tool_name,
                     success=True,
-                    output="Restrained: authoritative probe confirmed state PRESENT.",
+                    output=f"Restrained: authoritative probe confirmed state PRESENT. Data: {probe_data}" if probe_data else "Restrained: authoritative probe confirmed state PRESENT.",
                 )
-                restrained_ev = Evidence(source="probe_restraint", facts={"success": True, "observed_existing_state": True})
+                restrained_facts: Dict[str, Any] = {
+                    "success": True,
+                    "observed_existing_state": True,
+                }
+                if probe_data:
+                    restrained_facts["output"] = probe_data
+                    for pk, pv in probe_data.items():
+                        if pk not in restrained_facts:
+                            restrained_facts[pk] = pv
+                restrained_ev = Evidence(source="probe_restraint", facts=restrained_facts)
                 restrained_v = self.verifier.verify(
                     recovery_decision_id=f"restraint-step-{self.agent_state.step_index}",
                     evidence=restrained_ev,
@@ -719,12 +729,22 @@ class ReAgentPipeline:
                         })
                         self._record_action_success()
                         self.agent_state.status = AgentStatus.VERIFIED
+                        probe_data_2 = probe_res_2.get("data") if isinstance(probe_res_2.get("data"), dict) else {}
                         restrained_action = ActionResult(
                             tool_name=tool_name,
                             success=True,
-                            output="Restrained: delayed probe confirmed state PRESENT.",
+                            output=f"Restrained: delayed probe confirmed state PRESENT. Data: {probe_data_2}" if probe_data_2 else "Restrained: delayed probe confirmed state PRESENT.",
                         )
-                        restrained_ev = Evidence(source="probe_restraint", facts={"success": True, "observed_existing_state": True})
+                        restrained_facts_2: Dict[str, Any] = {
+                            "success": True,
+                            "observed_existing_state": True,
+                        }
+                        if probe_data_2:
+                            restrained_facts_2["output"] = probe_data_2
+                            for pk, pv in probe_data_2.items():
+                                if pk not in restrained_facts_2:
+                                    restrained_facts_2[pk] = pv
+                        restrained_ev = Evidence(source="probe_restraint", facts=restrained_facts_2)
                         restrained_v = self.verifier.verify(
                             recovery_decision_id=f"restraint-delayed-step-{self.agent_state.step_index}",
                             evidence=restrained_ev,

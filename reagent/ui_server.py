@@ -8981,7 +8981,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         if qs is None:
             qs = self._parse_qs()
         clean_path = self._clean_path()
-        task_type = qs.get("task_template") or qs.get("task_type") or ("hotel_booking" if "hotel" in clean_path else "wallet_transfer")
+        scenario_param = (qs.get("scenario") or "").lower()
+        is_hotel = (
+            "hotel" in clean_path
+            or "hotel" in scenario_param
+            or qs.get("task_template") == "hotel_booking"
+            or qs.get("task_type") == "hotel_booking"
+        )
+        task_type = "hotel_booking" if is_hotel else (qs.get("task_template") or qs.get("task_type") or "wallet_transfer")
         is_live_opt_in = (
             qs.get("live") in ("1", "true")
             or qs.get("action") == "live"
@@ -9049,17 +9056,22 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 task_objective = (
                     "Book Room 14B at Grand Hotel for Guest Maya Lin (booking_id: BKG-NM-9901, room_number: 14B, Amount: $350.00). "
                     "Propose success contract with tool arguments booking_id and room_number, and independent postconditions "
-                    "including KEY_EXISTS (target: booking_id) and VALUE_EQUALS (target: room_number). "
-                    "STATUS_SUCCESS alone is not permitted as state-changing actions require observable state proof."
+                    "including KEY_EXISTS (target: booking_id, expected: BKG-NM-9901) and VALUE_EQUALS (target: room_number, expected: 14B). "
+                    "Generic STATUS_SUCCESS without concrete observable state properties is strictly forbidden."
                 )
                 available_tools = ["hotel_booking_http"]
+                trusted_context = {"booking_id": "BKG-NM-9901", "room_number": "14B"}
             else:
                 task_objective = (
                     "Verify that wallet transfer TXN-20261001-002 for account ACCT-2201 "
-                    "has been correctly committed to the ledger. "
-                    "Amount: $500.00. Status must be COMMITTED. Read-only verification only."
+                    "has been correctly committed to the ledger. Amount: $500.00. Status must be COMMITTED. "
+                    "Propose success contract with tool 'dbops_read_only', arguments txn_id and query, "
+                    "and independent postconditions including KEY_EXISTS (target: txn_id, expected: TXN-20261001-002) "
+                    "and VALUE_EQUALS (target: status, expected: COMMITTED). "
+                    "Generic STATUS_SUCCESS without concrete observable state properties is strictly forbidden."
                 )
                 available_tools = ["dbops_read_only"]
+                trusted_context = {"txn_id": "TXN-20261001-002", "account_id": "ACCT-2201"}
 
             decision = provider.make_structured_decision(
                 task_objective=task_objective,
@@ -9092,56 +9104,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     contract_dict = dict(decision)
                 canonical_hash = compute_canonical_hash(contract_dict)
 
-                # Inline structural grounding check — runs offline, zero network calls.
-                # Enforces key invariants from ContractGroundingValidator without requiring
-                # a registered BaseTool instance (proposal context is advisory-only).
-                _grounding_errors: List[str] = []
-                _tool_name = contract_dict.get("tool", "")
-                _allowed_proposal_tools = {
-                    "dbops_read_only", "dbops_database",
-                    "inventory_read_only", "wallet_transfer",
-                    "hotel_booking_http",
-                }
-                if not _tool_name:
-                    _grounding_errors.append("GroundingFail: tool field is empty or missing.")
-                elif _tool_name not in _allowed_proposal_tools:
-                    _grounding_errors.append(
-                        f"GroundingFail: tool '{_tool_name}' is not in the allowed proposal set: "
-                        f"{sorted(_allowed_proposal_tools)}."
-                    )
-                _postconditions = contract_dict.get("proposed_postconditions", [])
-                if not _postconditions:
-                    _grounding_errors.append("GroundingFail: at least one postcondition is required.")
-                if len(_postconditions) > 10:
-                    _grounding_errors.append(
-                        f"GroundingFail: {len(_postconditions)} postconditions exceed the maximum of 10."
-                    )
-                # Reject provenance forgery — model must not claim EXECUTED status
-                if contract_dict.get("provenance") == "EXECUTED":
-                    _grounding_errors.append(
-                        "GroundingFail: provenance='EXECUTED' is forbidden — model proposals are advisory only."
-                    )
-                # For state-changing tools, STATUS_SUCCESS-only contracts are insufficient
-                _state_changing = {"dbops_database", "wallet_transfer", "hotel_booking_http"}
-                if _tool_name in _state_changing:
-                    _pred_types = {p.get("predicate", "") for p in _postconditions if isinstance(p, dict)}
-                    if _pred_types and _pred_types <= {"STATUS_SUCCESS"}:
-                        _grounding_errors.append(
-                            f"GroundingFail: tool '{_tool_name}' is state-changing; "
-                            "STATUS_SUCCESS alone is not an independently observable postcondition."
-                        )
-                if _tool_name == "hotel_booking_http":
-                    args = contract_dict.get("arguments", {})
-                    if isinstance(args, dict):
-                        if "booking_reference" in args and "booking_id" not in args:
-                            args["booking_id"] = args["booking_reference"]
-                    if not isinstance(args, dict) or not {"booking_id", "room_number"}.issubset(set(args.keys())):
-                        _grounding_errors.append(
-                            "GroundingFail: hotel_booking_http requires 'booking_id' and 'room_number' in arguments."
-                        )
-                grounding_valid = len(_grounding_errors) == 0
+                from reagent.contract_validator import validate_contract_proposal
+                val_res = validate_contract_proposal(
+                    contract_dict=contract_dict,
+                    task_objective=task_objective,
+                    workflow=task_type,
+                    task_context=trusted_context,
+                )
+                grounding_valid = val_res.is_valid
                 if not grounding_valid:
-                    grounding_failure = "; ".join(_grounding_errors)
+                    grounding_failure = "; ".join(val_res.errors)
 
             telemetry = ProviderTelemetryEvent(
                 run_id=run_id,
