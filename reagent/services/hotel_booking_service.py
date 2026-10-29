@@ -71,7 +71,8 @@ class HotelBookingDB:
                         status TEXT NOT NULL,
                         created_at REAL NOT NULL,
                         committed_at REAL NOT NULL,
-                        operation_id TEXT UNIQUE
+                        operation_id TEXT UNIQUE,
+                        fencing_token INTEGER DEFAULT 0
                     );
 
                     CREATE TABLE IF NOT EXISTS reservation_audit_log (
@@ -94,19 +95,33 @@ class HotelBookingDB:
         status: str = "CONFIRMED",
         operation_id: Optional[str] = None,
         skip_audit_log: bool = False,
+        fencing_token: Optional[int] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             conn = self._get_connection()
             try:
                 now = time.time()
                 op_id = operation_id or f"op_{int(now * 1000)}"
+                fence = int(fencing_token) if fencing_token is not None else 0
+
+                # Fencing check: reject stale generation if existing record has newer/equal token
+                existing = conn.execute(
+                    "SELECT fencing_token FROM reservations WHERE booking_id = ?",
+                    (booking_id,),
+                ).fetchone()
+                if existing and existing["fencing_token"] is not None:
+                    if fence <= int(existing["fencing_token"]):
+                        raise sqlite3.IntegrityError(
+                            f"StaleFencingToken: Incoming token {fence} is stale (<= existing {existing['fencing_token']})"
+                        )
+
                 conn.execute(
                     """
                     INSERT INTO reservations (
-                        booking_id, guest_name, room_number, amount, status, created_at, committed_at, operation_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        booking_id, guest_name, room_number, amount, status, created_at, committed_at, operation_id, fencing_token
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (booking_id, guest_name, room_number, amount, status, now, now, op_id),
+                    (booking_id, guest_name, room_number, amount, status, now, now, op_id, fence),
                 )
                 if not skip_audit_log:
                     conn.execute(
@@ -125,6 +140,7 @@ class HotelBookingDB:
                     "status": status,
                     "committed_at": now,
                     "operation_id": op_id,
+                    "fencing_token": fence,
                 }
             finally:
                 conn.close()
@@ -334,6 +350,8 @@ class HotelSimulatorHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "Required fields cannot be empty strings"}, status=400)
                 return
 
+            op_id = payload.get("operation_id")
+            fence_token = payload.get("fencing_token")
             fault_mode = payload.get("fault_mode") or self.headers.get("X-Fault-Mode") or self.server.global_fault
 
             # ── FAULT: FAIL_BEFORE_COMMIT ─────────────────────────────────────
@@ -366,10 +384,12 @@ class HotelSimulatorHTTPHandler(BaseHTTPRequestHandler):
                         room_number=room_number,
                         amount=amount,
                         status="PARTIAL",
+                        operation_id=op_id,
+                        fencing_token=fence_token,
                         skip_audit_log=True,
                     )
-                except sqlite3.IntegrityError:
-                    self._send_json({"error": "DuplicateReservation: Booking ID already exists"}, status=409)
+                except sqlite3.IntegrityError as ie:
+                    self._send_json({"error": f"DuplicateReservationOrStaleFencing: {ie}"}, status=409)
                     return
 
                 self._send_json(
@@ -392,9 +412,11 @@ class HotelSimulatorHTTPHandler(BaseHTTPRequestHandler):
                         room_number=room_number,
                         amount=amount,
                         status="CONFIRMED",
+                        operation_id=op_id,
+                        fencing_token=fence_token,
                     )
-                except sqlite3.IntegrityError:
-                    self._send_json({"error": "DuplicateReservation: Booking ID already exists"}, status=409)
+                except sqlite3.IntegrityError as ie:
+                    self._send_json({"error": f"DuplicateReservationOrStaleFencing: {ie}"}, status=409)
                     return
 
                 # Drop connection abruptly without sending HTTP response headers
@@ -416,10 +438,12 @@ class HotelSimulatorHTTPHandler(BaseHTTPRequestHandler):
                     room_number=room_number,
                     amount=amount,
                     status="CONFIRMED",
+                    operation_id=op_id,
+                    fencing_token=fence_token,
                 )
-            except sqlite3.IntegrityError:
+            except sqlite3.IntegrityError as ie:
                 self._send_json(
-                    {"error": f"DuplicateReservation: Booking ID '{booking_id}' already exists"},
+                    {"error": f"DuplicateReservationOrStaleFencing: {ie}"},
                     status=409,
                 )
                 return

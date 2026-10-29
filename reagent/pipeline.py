@@ -401,6 +401,7 @@ class ReAgentPipeline:
         max_recovery_attempts: int = 1,
         probe_callback: Optional[Callable[[str, Dict[str, Any], int], Dict[str, Any]]] = None,
         supports_idempotency: Optional[bool] = None,
+        supports_fencing: Optional[bool] = None,
     ) -> ExecutionCycleResult:
         """
         Full M3 pipeline execution with contract, verification, and recovery:
@@ -534,6 +535,8 @@ class ReAgentPipeline:
                     max_attempts=max_recovery_attempts,
                     probe_callback=probe_callback,
                     supports_idempotency=supports_idempotency,
+                    supports_fencing=supports_fencing,
+                    initial_action_result=action_res,
                 )
             )
 
@@ -582,6 +585,8 @@ class ReAgentPipeline:
         max_attempts: int,
         probe_callback: Optional[Callable[[str, Dict[str, Any], int], Dict[str, Any]]] = None,
         supports_idempotency: Optional[bool] = None,
+        supports_fencing: Optional[bool] = None,
+        initial_action_result: Optional[ActionResult] = None,
     ) -> Tuple[ActionResult, Evidence, VerificationResult, int, AgentStatus]:
         """
         Attempt bounded recovery when initial verification fails.
@@ -786,6 +791,7 @@ class ReAgentPipeline:
             # Safety gate for retry on non-idempotent operations:
             tool_obj = self.tool_registry.get_tool(tool_name)
             is_idempotent = supports_idempotency if supports_idempotency is not None else getattr(tool_obj, "supports_idempotency_key", False)
+            fencing_capable = supports_fencing if supports_fencing is not None else getattr(tool_obj, "supports_fencing", False)
 
             # Check for unfenced or eventual-consistency absence:
             is_unfenced = (
@@ -796,9 +802,34 @@ class ReAgentPipeline:
                 or probe_res.get("consistency") in ("EVENTUAL", "WEAK")
                 or probe_res.get("consistency_guarantee") in ("EVENTUAL", "WEAK")
             )
-            is_confirmed_absent = (probe_status == "CONFIRMED_ABSENT" and not is_unfenced)
+            has_late_write_risk = (
+                probe_res.get("in_flight_possible") is True
+                or probe_res.get("late_write_possible") is True
+                or probe_res.get("late_write_risk") is True
+            )
+            is_confirmed_absent = (probe_status == "CONFIRMED_ABSENT" and not is_unfenced and not has_late_write_risk)
 
-            if not is_idempotent and not is_confirmed_absent:
+            # LATE-WRITE RISK GUARD:
+            # If the probe indicates in-flight/delayed write risk on an unfenced/non-idempotent adapter:
+            if has_late_write_risk and not is_idempotent and not fencing_capable:
+                reason = (
+                    f"LateWriteRiskProhibitsRetry: {tool_name} encountered in-flight write risk, "
+                    f"and adapter does not guarantee idempotency or write fencing; "
+                    f"temporary absence cannot rule out delayed late commit. Escalating safely (UNKNOWN != ABSENT)."
+                )
+                timeline.emit("SAFETY_GATE_BLOCKED_RETRY", {"reason": reason})
+                self.agent_state.status = AgentStatus.ESCALATED
+                self.reliability_state.escalations += 1
+                dummy = ActionResult(tool_name=tool_name, success=False, error=reason)
+                esc_ev = self.evidence_collector.collect_from_action(dummy)
+                esc_v = self.verifier.verify(
+                    recovery_decision_id=f"step-{self.agent_state.step_index}-late-write-gate",
+                    evidence=esc_ev,
+                    assertions=assertion_rules,
+                )
+                return dummy, esc_ev, esc_v, 0, AgentStatus.ESCALATED
+
+            if not is_idempotent and not fencing_capable and not is_confirmed_absent:
                 # Ambiguous non-idempotent operation without authoritative absence confirmation -> FAIL CLOSED
                 if is_unfenced:
                     reason = (
@@ -849,13 +880,29 @@ class ReAgentPipeline:
         # execute the safe recovery retry directly under the frozen contract, bounded by max_attempts.
         if probe_callback is not None:
             if max_attempts > 0:
-                rec_action = self.tool_registry.execute_tool(tool_name, original_params)
-                self._append_execution_event(task.task_id, tool_name, original_params, rec_action)
+                retry_params = dict(original_params)
+                # Mechanism A: Stable operation identity preserved across retry attempts
+                if "operation_id" not in retry_params:
+                    retry_params["operation_id"] = (
+                        original_params.get("booking_id")
+                        or original_params.get("idempotency_key")
+                        or original_params.get("txn_id")
+                        or f"op_{task.task_id}_{self.agent_state.step_index}"
+                    )
+                # Mechanism B: Generation / Fencing token increment
+                if fencing_capable:
+                    curr_fence = int(retry_params.get("fencing_token", 1))
+                    retry_params["fencing_token"] = curr_fence + 1
+
+                rec_action = self.tool_registry.execute_tool(tool_name, retry_params)
+                self._append_execution_event(task.task_id, tool_name, retry_params, rec_action)
                 recovery_count = 1
                 timeline.emit(PHASE_RECOVERY_EXECUTED, {
                     "attempt": 1,
                     "tool": tool_name,
                     "success": rec_action.success,
+                    "operation_id": retry_params.get("operation_id"),
+                    "fencing_token": retry_params.get("fencing_token"),
                 })
                 rec_evidence = self.evidence_collector.collect_from_action(rec_action)
                 timeline.emit(PHASE_EVIDENCE_COLLECTED, {"evidence_id": rec_evidence.evidence_id})

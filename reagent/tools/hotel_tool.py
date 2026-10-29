@@ -22,6 +22,8 @@ class HotelBookingHttpTool(BaseTool):
         "State-changing tool requiring independent postcondition verification."
     )
     effect_class = "state-changing"
+    supports_idempotency_key = True
+    supports_fencing = True
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -53,6 +55,10 @@ class HotelBookingHttpTool(BaseTool):
             "amount": amount,
             "fault_mode": fault_mode,
         }
+        if "operation_id" in params:
+            payload["operation_id"] = params["operation_id"]
+        if "fencing_token" in params:
+            payload["fencing_token"] = params["fencing_token"]
 
         try:
             resp = requests.post(url, json=payload, timeout=timeout)
